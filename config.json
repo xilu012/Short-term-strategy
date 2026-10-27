@@ -32,5 +32,6 @@
   "min_rise_retention_ratio": 0.5,
   "max_failed_breakouts": 2,
   "sell_review_after_minutes": 60,
-  "context_interval_seconds": 120
+  "context_interval_seconds": 120,
+  "context_enabled": true
 }

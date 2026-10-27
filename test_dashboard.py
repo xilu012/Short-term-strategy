@@ -42,6 +42,13 @@ class ModelTests(unittest.TestCase):
         self.model.ingest("done", "已停止")
         self.assertEqual(self.model.state, "error")
 
+    def test_paused_monitor_does_not_present_actionable_candidate(self):
+        row = self.row()
+        self.model.clear("live")
+        for state in ("paused", "retrying", "stopping", "stopped", "error"):
+            self.model.ingest("lifecycle", state)
+            self.assertEqual(self.model.stage(row, row["ts"]), "暂停确认")
+
 
 @unittest.skipUnless(os.environ.get("DISPLAY"), "需要桌面显示")
 class DesktopTests(unittest.TestCase):

@@ -220,6 +220,11 @@ class ClientTests(unittest.TestCase):
         req = monitor.urllib.request.Request("https://fuyao.aicubes.cn/api", headers={"X-api-key": "test"})
         self.assertIsNone(monitor.NoRedirect().redirect_request(req, None, 302, "", {}, "https://other.invalid"))
 
+    def test_statistics_response_does_not_require_item_array(self):
+        c = self.client(dict(code=0, data=dict(trade_date="2026-10-26", seal_rate=0.7)))
+        data, _ = c.get("/api/a-share/special-data/limit-up-statistics", date="2026-10-26")
+        self.assertEqual(data["seal_rate"], 0.7)
+
 
 class RuntimeTests(unittest.TestCase):
     def test_session_clock_lunch_weekend(self):

@@ -16,11 +16,13 @@ import urllib.parse
 import urllib.request
 
 from strategy import CN, Engine, Tick, holding_event, limit_price, main_board, market_time
+from market_context import MarketContext
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
 BASE = "https://fuyao.aicubes.cn"
 POSITIONS_LOCK = threading.Lock()
+VERSION = "0.2"
 
 
 def configuration(path=None):
@@ -31,6 +33,10 @@ def configuration(path=None):
             raise ValueError("配置含未知字段")
         c.update(override)
     for k, v in c.items():
+        if k == "context_enabled":
+            if not isinstance(v, bool):
+                raise ValueError("context_enabled 必须为布尔值")
+            continue
         if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0:
             raise ValueError("配置必须是有限正数: " + k)
     for k in ("batch_size", "max_watch", "min_rise_samples", "min_stable_updates", "rebound_confirm_updates", "max_failed_breakouts"):
@@ -44,9 +50,10 @@ def configuration(path=None):
 
 
 class ApiError(Exception):
-    def __init__(self, text, retry=False):
+    def __init__(self, text, retry=False, code=None):
         super().__init__(text)
         self.retry = retry
+        self.code = code
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -63,7 +70,10 @@ class Client:
         self.opener = urllib.request.build_opener(NoRedirect())
 
     def get(self, path, **params):
-        if path not in ("/api/meta/tickers/list", "/api/a-share/prices/snapshot", "/api/a-share/auction/snapshot"):
+        if path not in ("/api/meta/tickers/list", "/api/a-share/prices/snapshot", "/api/a-share/auction/snapshot",
+                        "/api/a-share/calendar/trading-days", "/api/a-share/special-data/limit-up-pool",
+                        "/api/a-share/special-data/limit-up-statistics", "/api/a-share-index/prices/snapshot",
+                        "/api/a-share-index/catalog/ths-index-list", "/api/a-share-index/constituents/ths-stock-list"):
             raise ApiError("未允许的接口")
         url = BASE + path + "?" + urllib.parse.urlencode(params)
         req = urllib.request.Request(url, headers={"X-api-key": self.key, "User-Agent": "AShareResearchMonitor/0.1"})
@@ -81,9 +91,9 @@ class Client:
         if code != 0:
             label = {2001: "密钥无效或缺失", 2003: "接口权限不足", 4001: "请求限流"}.get(code, "业务接口错误")
             # No raw server error bodies: they may contain sensitive request details.
-            raise ApiError(f"{label}（code={code if isinstance(code, int) else 'unknown'}）", retry=code == 4001)
+            raise ApiError(f"{label}（code={code if isinstance(code, int) else 'unknown'}）", retry=code == 4001, code=code)
         data = payload.get("data")
-        if not isinstance(data, dict) or not isinstance(data.get("item"), list):
+        if not isinstance(data, dict) or (path != "/api/a-share/special-data/limit-up-statistics" and not isinstance(data.get("item"), list)):
             raise ApiError("响应字段不符合文档：缺少 data.item")
         return data, time.monotonic()-started
 
@@ -112,7 +122,7 @@ class Storage:
         self.db.execute("CREATE TABLE IF NOT EXISTS sessions (started REAL, mode TEXT, config TEXT)")
 
     def session(self, mode, config):
-        self.db.execute("INSERT INTO sessions VALUES (?,?,?)", (time.time(), mode, json.dumps(config)))
+        self.db.execute("INSERT INTO sessions VALUES (?,?,?)", (time.time(), mode, json.dumps(dict(version=VERSION, parameters=config))))
         self.db.commit()
 
     def frame(self, kind, data, received, elapsed):
@@ -193,6 +203,7 @@ class Monitor:
         self.codes = codes
         self.engine = Engine(config)
         self.positions = Positions()
+        self.market_context = MarketContext(config, DATA)
         self.store = None
         self.stats = {"universe": 0, "watch": 0, "requests": 0}
 
@@ -209,9 +220,12 @@ class Monitor:
                     vwap=t.turnover/t.volume if t.volume else None,
                     distance=(limit_price(t.prev)/t.price-1)*100,
                     low=s.low if s else None, confirming=bool(s and s.confirm_updates),
-                    position=dict(position) if position else None)
+                    position=dict(position) if position else None,
+                    context=self.market_context.stock_view(t.code, t.ts, t.gain))
 
     def send_event(self, event):
+        event.metrics["version"] = VERSION
+        event.metrics["context"] = self.market_context.view(event.code, event.ts, event.metrics.get("gain"))
         self.store.event(event)
         self.emit("event", asdict(event))
 
@@ -219,11 +233,11 @@ class Monitor:
         stamp = data.get("timestamp")
         if not isinstance(stamp, (int, float)) or not math.isfinite(stamp):
             self.emit("status", "批次缺少有效行情时间，已存档但不生成信号")
-            return
+            return False
         age = received-stamp/1000
         if age > self.c["max_batch_age_seconds"] or age < -5:
             self.emit("status", f"批次行情时间异常/过旧（{age:.1f}秒），不生成信号")
-            return
+            return False
         with self.positions.lock:
             positions = self.positions.read()
             views = []
@@ -248,6 +262,7 @@ class Monitor:
                 self.positions.write(positions)
         if views:
             self.emit("quotes", views)
+        return True
 
     def run(self):
         try:
@@ -267,7 +282,20 @@ class Monitor:
                     self.stop.wait(0.35)
                 return
             client = Client(self.key)
-            names = client.universe(self.stop)
+            startup_backoff = 2
+            while not self.stop.is_set():
+                try:
+                    names = client.universe(self.stop)
+                    break
+                except ApiError as e:
+                    if not e.retry:
+                        raise
+                    self.emit("lifecycle", "retrying")
+                    self.emit("status", f"代码表连接失败，{startup_backoff}秒后重试")
+                    self.stop.wait(startup_backoff)
+                    startup_backoff = min(startup_backoff*2, 120)
+            if self.stop.is_set():
+                return
             if self.codes:
                 names = {k: v for k, v in names.items() if k in self.codes}
             if not names:
@@ -304,9 +332,12 @@ class Monitor:
                     raise ApiError("交易日已变化，请重新启动以刷新股票池与ST状态")
                 day = str(now.date())
             phase = session_phase(now)
+            calendar = self.market_context.calendar_days
+            if self.c["context_enabled"] and calendar is not None and now.date() not in calendar:
+                phase = "closed"
             if phase == "closed":
                 self.emit("lifecycle", "paused")
-                self.emit("status", "非连续交易/竞价时段，暂停请求；节假日另以行情新鲜度拦截")
+                self.emit("status", "当前休市，保持运行将于下一交易时段继续；午休后重新观察盘中结构。")
                 self.stop.wait(30)
                 continue
             try:
@@ -346,6 +377,14 @@ class Monitor:
                 if is_watch:
                     batch = watch
                     next_watch = mono+self.c["watch_interval_seconds"]
+                elif self.market_context.due(mono):
+                    extra = self.market_context.step(client, time.time(), mono)
+                    if extra and "data" in extra:
+                        self.store.frame("context:"+extra["task"], extra["data"], time.time(), extra["elapsed"])
+                        self.stats["requests"] += 1
+                    self.emit("context", self.market_context.view())
+                    self.stop.wait(0.5)
+                    continue
                 elif mono >= next_scan:
                     batch = codes[cursor:cursor+self.c["batch_size"]]
                     cursor += len(batch)
@@ -361,6 +400,8 @@ class Monitor:
                 received = time.time()
                 data["_context"] = {"held": sorted(held), "names": {k: names[k]["name"] for k in batch}}
                 self.store.frame("watch" if is_watch else "scan", data, received, elapsed)
+                if self.stop.is_set():
+                    return
                 for row in data["item"]:
                     code = row.get("thscode")
                     if code not in names:
@@ -376,14 +417,15 @@ class Monitor:
                             candidates.pop(code, None)
                     except (ValueError, TypeError, KeyError, ZeroDivisionError):
                         continue
-                self.consume(data, received, names, held)
+                valid = self.consume(data, received, names, held)
                 self.stats.update(watch=len(watch), requests=self.stats["requests"]+1,
                                   received=received, elapsed=elapsed, batch_ms=data.get("timestamp"))
                 self.emit("stats", dict(self.stats))
-                self.emit("lifecycle", "running")
+                self.emit("lifecycle", "running" if valid else "stale")
                 stamp = data.get("timestamp")
                 age = f"{received-stamp/1000:.1f}秒" if isinstance(stamp, (float, int)) else "未知"
-                self.emit("status", f"{'重点' if is_watch else '扫描'} {len(data['item'])}只 | 请求{elapsed:.2f}秒 | 批次最新行情距接收{age}（不代表每只股票）")
+                if valid:
+                    self.emit("status", f"{'重点' if is_watch else '扫描'} {len(data['item'])}只 | 请求{elapsed:.2f}秒 | 批次最新行情距接收{age}（不代表每只股票）")
                 cycles += 1
                 backoff = 2
                 if self.max_cycles and cycles >= self.max_cycles:

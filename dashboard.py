@@ -13,7 +13,7 @@ from strategy import CN, market_time
 BG, PANEL, TEXT, MUTED = "#101827", "#192438", "#e8eef7", "#95a7bf"
 RED, GREEN, AMBER, BLUE = "#ff767d", "#5bd3a2", "#f5c66e", "#6ea8fe"
 STAGES = {"search": "扫描", "rising": "快速拉升", "pullback": "回落观察", "signaled": "入场候选", "cooldown": "已失效"}
-STATES = {"idle": "尚未启动", "loading": "连接数据源", "running": "监控中", "demo": "演示中",
+STATES = {"idle": "尚未启动", "loading": "连接数据源", "running": "监控中", "demo": "演示中", "stale": "行情过旧 · 暂停信号",
           "paused": "休市等待", "retrying": "连接重试", "stopping": "正在停止", "stopped": "已停止", "error": "连接异常"}
 
 
@@ -48,7 +48,7 @@ class DashboardModel:
                 self.quotes[code] = row
                 history = self.histories.setdefault(code, deque(maxlen=360))
                 if not old or (old["price"], old["volume"], old["turnover"]) != (row["price"], row["volume"], row["turnover"]):
-                    history.append(row)
+                    history.append({k: row.get(k) for k in ("ts", "price", "volume", "turnover", "vwap")})
         elif kind == "event":
             self.latest[value["code"]] = value
             self.events.appendleft(value)
@@ -69,6 +69,8 @@ class DashboardModel:
     def stage(self, row, now):
         if row.get("position"):
             return "持仓"
+        if self.mode != "demo" and self.state in ("paused", "retrying", "error", "stopped", "stopping", "stale"):
+            return "暂停确认"
         if self.mode != "demo" and now-row["ts"] > self.config["max_batch_age_seconds"]:
             return "待更新"
         stage = STAGES.get(row.get("phase"), "扫描")
@@ -90,7 +92,9 @@ class DashboardModel:
                 continue
             stage = self.stage(row, now)
             gain = (row["price"]/row["prev"]-1)*100
-            candidate = gain >= self.config["candidate_gain_pct"] or code in self.latest or stage != "扫描"
+            gap = (row["opening"]/row["prev"]-1)*100
+            candidate = (gain >= self.config["candidate_gain_pct"] or gap >= self.config["candidate_gap_pct"] or
+                         code in self.latest or row.get("phase") in ("rising", "pullback", "signaled"))
             if selection == "持仓":
                 if not row.get("position"):
                     continue
@@ -108,11 +112,15 @@ class Dashboard:
     def __init__(self, window, config, service):
         import tkinter as tk
         from tkinter import ttk
+        from tkinter import font as tkfont
+        available = set(tkfont.families(window))
+        self.font = next((name for name in ("Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", "WenQuanYi Micro Hei") if name in available), "Arial")
         self.tk, self.ttk, self.window, self.service = tk, ttk, window, service
         self.config, self.model = config, DashboardModel(config)
         self.messages, self.stop = queue.Queue(), threading.Event()
         self.worker, self.selected, self.popups = None, None, {}
         self.key = tk.StringVar(value=os.environ.get("FUYAO_API_KEY", ""))
+        self.context_enabled = tk.BooleanVar(value=config["context_enabled"])
         self.filter = tk.StringVar(value="全部候选")
         self.search = tk.StringVar()
         self.banner = tk.StringVar(value=STATES["idle"])
@@ -130,11 +138,11 @@ class Dashboard:
         style = ttk.Style(window)
         style.theme_use("clam")
         style.configure("TFrame", background=BG)
-        style.configure("TLabel", background=BG, foreground=TEXT, font=("Microsoft YaHei UI", 10))
+        style.configure("TLabel", background=BG, foreground=TEXT, font=(self.font, 10))
         style.configure("TButton", background="#263c5b", foreground=TEXT, padding=(12, 7), borderwidth=0)
         style.map("TButton", background=[("active", "#365b87"), ("disabled", "#182336")])
         style.configure("Treeview", background=PANEL, fieldbackground=PANEL, foreground=TEXT,
-                        rowheight=33, borderwidth=0, font=("Microsoft YaHei UI", 10))
+                        rowheight=33, borderwidth=0, font=(self.font, 10))
         style.configure("Treeview.Heading", background="#23334d", foreground=MUTED, padding=8)
         style.map("Treeview", background=[("selected", "#2d4d70")], foreground=[("selected", "white")])
         style.configure("TNotebook", background=BG, borderwidth=0)
@@ -148,7 +156,7 @@ class Dashboard:
         tk, ttk = self.tk, self.ttk
         header = ttk.Frame(self.window, padding=(18, 12))
         header.pack(fill="x")
-        ttk.Label(header, text="A股短线雷达", font=("Microsoft YaHei UI", 20, "bold")).pack(side="left")
+        ttk.Label(header, text="A股短线雷达", font=(self.font, 20, "bold")).pack(side="left")
         ttk.Label(header, textvariable=self.banner, foreground=GREEN).pack(side="left", padx=25)
         self.start_button = ttk.Button(header, text="启动监控", command=lambda: self.start("live"))
         self.start_button.pack(side="right", padx=5)
@@ -157,6 +165,8 @@ class Dashboard:
         menu = tk.Menu(header, tearoff=False)
         menu.add_command(label="合成行情演示", command=lambda: self.start("demo"))
         menu.add_command(label="测试提示音", command=self.sound)
+        menu.add_command(label="数据连接状态", command=self.connection_details)
+        menu.add_checkbutton(label="市场与行业背景", variable=self.context_enabled, command=self.toggle_context)
         menu.add_command(label="指标与使用说明", command=self.help)
         button = ttk.Button(header, text="工具 ▾", command=lambda: menu.tk_popup(button.winfo_rootx(), button.winfo_rooty()+button.winfo_height()))
         button.pack(side="right", padx=5)
@@ -171,8 +181,8 @@ class Dashboard:
         for label, value in self.cards.items():
             box = tk.Frame(cards, bg=PANEL, padx=15, pady=10)
             box.pack(side="left", fill="x", expand=True, padx=(0, 8))
-            tk.Label(box, text=label, bg=PANEL, fg=MUTED, font=("Microsoft YaHei UI", 10)).pack(anchor="w")
-            tk.Label(box, textvariable=value, bg=PANEL, fg=TEXT, font=("Microsoft YaHei UI", 16, "bold")).pack(anchor="w")
+            tk.Label(box, text=label, bg=PANEL, fg=MUTED, font=(self.font, 10)).pack(anchor="w")
+            tk.Label(box, textvariable=value, bg=PANEL, fg=TEXT, font=(self.font, 16, "bold")).pack(anchor="w")
         ttk.Label(self.window, textvariable=self.market, foreground=MUTED, padding=(20, 4)).pack(fill="x")
         body = ttk.Panedwindow(self.window, orient="horizontal")
         body.pack(fill="both", expand=True, padx=18, pady=10)
@@ -211,7 +221,7 @@ class Dashboard:
             self.alerts.column(col, width=100)
         self.alerts.pack(fill="both", expand=True)
         self.alerts.bind("<<TreeviewSelect>>", self.select_alert)
-        ttk.Label(right, textvariable=self.detail_title, font=("Microsoft YaHei UI", 17, "bold"), padding=(15, 4)).pack(anchor="w")
+        ttk.Label(right, textvariable=self.detail_title, font=(self.font, 17, "bold"), padding=(15, 4)).pack(anchor="w")
         ttk.Label(right, textvariable=self.detail_metrics, wraplength=470, padding=(15, 4)).pack(anchor="w")
         self.chart = tk.Canvas(right, bg=PANEL, highlightthickness=0, height=300)
         self.chart.pack(fill="both", expand=True, padx=(12, 0), pady=10)
@@ -222,6 +232,11 @@ class Dashboard:
 
     def mark_dirty(self):
         self.dirty = True
+
+    def toggle_context(self):
+        self.config["context_enabled"] = self.context_enabled.get()
+        self.model.status = "市场背景已开启" if self.config["context_enabled"] else "市场背景已关闭，个股监控继续"
+        self.mark_dirty()
 
     def start(self, mode):
         from tkinter import messagebox
@@ -247,6 +262,8 @@ class Dashboard:
     def request_stop(self):
         self.stop.set()
         self.model.state = "stopping"
+        for code in list(self.popups):
+            self.dismiss(code)
         self.mark_dirty()
 
     def sound(self):
@@ -275,7 +292,7 @@ class Dashboard:
         popup.configure(bg=PANEL)
         popup.attributes("-topmost", True)
         text = self.service.show_event(event)
-        self.tk.Label(popup, text=text, bg=PANEL, fg=TEXT, font=("Microsoft YaHei UI", 11),
+        self.tk.Label(popup, text=text, bg=PANEL, fg=TEXT, font=(self.font, 11),
                       wraplength=520, justify="left", padx=20, pady=20).pack()
         dismiss = lambda: self.dismiss(code)
         self.ttk.Button(popup, text="知道了", command=dismiss).pack(pady=(0, 12))
@@ -315,7 +332,16 @@ class Dashboard:
             reason += f"\n{market_time(event['ts']):%H:%M:%S} {event['kind']}：{event['reason']}"
             if event.get("low"):
                 reason += f"\n承接低点参考 {event['low']:.2f}"
+            evidence = event.get("metrics", {})
+            if evidence.get("confirmed_updates"):
+                reason += f"\n触发时确认 {evidence['confirmed_updates']}次 · 放量 {number(evidence.get('volume_ratio'), 1, '倍')}"
         position = row.get("position")
+        context = row.get("context", {})
+        reason += "\n"+context.get("pattern", "首板/连板待核实")
+        for sector in context.get("sectors", [])[:3]:
+            reason += f"\n{sector['name']} {number(sector.get('gain'), 2, '%', True)} · 相对强度 {number(sector.get('relative_gain'), 2, '个百分点', True)}"
+        if not context.get("sectors"):
+            reason += "\n行业归属：未获取或映射尚未完成"
         if position:
             reason += f"\n持仓 {position['shares']}股 · 成本 {position['cost']:.2f} · 浮盈亏 {(row['price']/position['cost']-1)*100:+.2f}%"
             reason += "\n"+position.get("status", "等待行情")
@@ -356,7 +382,7 @@ class Dashboard:
         for r, rate in zip(points[1:], deltas):
             xx = x(r["ts"])
             canvas.create_line(xx, h-25, xx, h-25-rate/scale*(h*0.2), fill="#52799f", width=3)
-        canvas.create_text(left, 12, text="已采集价格 / 成交均价 · 下方为成交额速率", anchor="w", fill=MUTED, font=("Microsoft YaHei UI", 9))
+        canvas.create_text(left, 12, text="已采集价格 / 成交均价 · 下方为成交额速率", anchor="w", fill=MUTED, font=(self.font, 9))
         canvas.create_text(left, h-10, text=f"{market_time(start):%H:%M:%S}", anchor="w", fill=MUTED)
         canvas.create_text(right, h-10, text=f"{market_time(end):%H:%M:%S}", anchor="e", fill=MUTED)
 
@@ -373,6 +399,23 @@ class Dashboard:
         self.cards["候选"].set(str(self.model.counts["入场候选"]))
         self.cards["请求"].set(number(stats.get("elapsed"), 2, "秒"))
         self.status.set(self.model.status)
+        context = self.model.context if self.config["context_enabled"] else {"enabled": False}
+        if not context.get("enabled", True):
+            self.market.set("市场背景已关闭")
+        else:
+            background = []
+            now = time.time()
+            for code in ("000001.SH", "399001.SZ"):
+                index = context.get("indices", {}).get(code)
+                if index and -5 <= now-index["timestamp"]/1000 <= self.config["context_interval_seconds"]*2:
+                    background.append(f"{index['name']} {number(index['gain'], 2, '%', True)}")
+            market = context.get("market")
+            if market and -5 <= now-market["timestamp"]/1000 <= self.config["context_interval_seconds"]*2:
+                background.append(f"全市场涨停 {market.get('limit_up_stock_count', '—')}家 · 打开 {market.get('open_stock_count', '—')}家 · 封板率 {number(market.get('seal_rate')*100 if isinstance(market.get('seal_rate'), (int, float)) else None, 1, '%')}")
+            background.append("行业映射 "+context.get("mapping", "等待数据"))
+            if context.get("errors"):
+                background.append("部分附加数据未获取")
+            self.market.set("  |  ".join(background))
         rows = self.model.rows(self.filter.get(), self.search.get().strip())
         wanted = {row["code"] for row, _ in rows}
         for iid in self.table.get_children():
@@ -403,9 +446,10 @@ class Dashboard:
                 kind, value = self.messages.get_nowait()
                 if kind == "event":
                     value = dict(value)
-                    if self.model.mode != "demo" and value["kind"] == "入场候选" and time.time()-value["ts"] > self.config["signal_expiry_seconds"]:
-                        value.update(kind="失效", reason="提醒到达时已过期")
-                    self.notify(value)
+                    if self.model.mode != "demo" and value["kind"] == "入场候选" and (self.stop.is_set() or time.time()-value["ts"] > self.config["signal_expiry_seconds"]):
+                        value.update(kind="失效", reason="监控已停止或提醒到达时已过期")
+                    if not self.stop.is_set():
+                        self.notify(value)
                 self.model.ingest(kind, value)
                 self.mark_dirty()
                 processed += 1
@@ -454,6 +498,16 @@ class Dashboard:
                             "走势图只展示程序已采集的数据，参考涨停价不是权威交易价格。\n"
                             "先演示再启动实时监控；笔记本须保持联网、不休眠。\n"
                             "参数仍属实验，信号不等于成交；T+1、费用和流动性需另行评估。")
+
+    def connection_details(self):
+        from tkinter import messagebox
+        labels = dict(calendar="交易日历", previous="昨日涨停池", stats="涨停市场统计", catalog="行业目录",
+                      indices="指数行情", members="行业成分", cache="本地缓存")
+        errors = self.model.context.get("errors", {})
+        text = "主监控："+STATES.get(self.model.state, self.model.state)
+        text += "\n行业映射："+self.model.context.get("mapping", "等待数据")
+        text += "\n\n"+("\n".join(labels.get(k,k)+"："+v for k,v in errors.items()) if errors else "尚未记录附加接口错误；未显示数值也可能是尚未请求或数据已过期。")
+        messagebox.showinfo("数据连接状态", text)
 
     def close(self):
         self.stop.set(); self.key.set("")
