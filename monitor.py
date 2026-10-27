@@ -15,7 +15,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from strategy import CN, Engine, Tick, holding_event, main_board, market_time
+from strategy import CN, Engine, Tick, holding_event, limit_price, main_board, market_time
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
@@ -194,6 +194,21 @@ class Monitor:
         self.engine = Engine(config)
         self.positions = Positions()
         self.store = None
+        self.stats = {"universe": 0, "watch": 0, "requests": 0}
+
+    def quote_view(self, t, position=None):
+        s = self.engine.states.get(t.code)
+        history = list(s.history) if s else []
+        first = next((x for x in history if t.ts-x.ts <= 60), t)
+        speed = (t.price/first.price-1)*100 if t.ts > first.ts else None
+        last = history[-2] if len(history) > 1 else None
+        rate = (t.volume-last.volume)/(t.ts-last.ts) if last and t.ts > last.ts else None
+        return dict(**asdict(t), phase=s.phase if s else "search", ready=bool(s and s.watch_sent),
+                    speed=speed, volume_ratio=rate/max(1, s.pull_rate) if s and s.pull_rate and rate is not None else None,
+                    pullback=(1-t.price/s.peak)*100 if s and s.peak else None,
+                    vwap=t.turnover/t.volume if t.volume else None,
+                    distance=(limit_price(t.prev)/t.price-1)*100,
+                    low=s.low if s else None, position=dict(position) if position else None)
 
     def send_event(self, event):
         self.store.event(event)
@@ -210,6 +225,7 @@ class Monitor:
             return
         with self.positions.lock:
             positions = self.positions.read()
+            views = []
             for row in data["item"]:
                 code = row.get("thscode")
                 if code not in names:
@@ -226,11 +242,15 @@ class Monitor:
                     e = holding_event(positions[code], t, self.c)
                     if e:
                         self.send_event(e)
+                views.append(self.quote_view(t, positions.get(code)))
             if positions:
                 self.positions.write(positions)
+        if views:
+            self.emit("quotes", views)
 
     def run(self):
         try:
+            self.emit("lifecycle", "loading")
             self.store = Storage(self.mode)
             self.store.session(self.mode, self.c)
             if self.mode == "demo":
@@ -241,6 +261,8 @@ class Monitor:
                     self.emit("status", f"演示 {market_time(t.ts):%H:%M:%S} 价格 {t.price:.2f}，使用合成数据")
                     for e in self.engine.feed(t):
                         self.send_event(e)
+                    self.emit("quotes", [self.quote_view(t)])
+                    self.emit("lifecycle", "demo")
                     self.stop.wait(0.35)
                 return
             client = Client(self.key)
@@ -249,11 +271,15 @@ class Monitor:
                 names = {k: v for k, v in names.items() if k in self.codes}
             if not names:
                 raise ApiError("没有符合主板、非ST、上市满60自然日条件的股票，或代码表权限/字段不满足要求")
+            self.stats["universe"] = len(names)
+            self.emit("stats", dict(self.stats))
             self.emit("status", f"股票池 {len(names)} 只；重点观察最多 {self.c['max_watch']} 只；尚未验证交易效果")
             self.loop(client, names)
         except ApiError as e:
+            self.emit("lifecycle", "error")
             self.emit("error", str(e))
         except Exception as e:
+            self.emit("lifecycle", "error")
             # Deliberately no exception text/traceback containing headers or secrets.
             self.emit("error", f"本地处理失败（{type(e).__name__}），请检查配置、持仓文件及磁盘权限")
         finally:
@@ -278,6 +304,7 @@ class Monitor:
                 day = str(now.date())
             phase = session_phase(now)
             if phase == "closed":
+                self.emit("lifecycle", "paused")
                 self.emit("status", "非连续交易/竞价时段，暂停请求；节假日另以行情新鲜度拦截")
                 self.stop.wait(30)
                 continue
@@ -349,6 +376,10 @@ class Monitor:
                     except (ValueError, TypeError, KeyError, ZeroDivisionError):
                         continue
                 self.consume(data, received, names, held)
+                self.stats.update(watch=len(watch), requests=self.stats["requests"]+1,
+                                  received=received, elapsed=elapsed, batch_ms=data.get("timestamp"))
+                self.emit("stats", dict(self.stats))
+                self.emit("lifecycle", "running")
                 stamp = data.get("timestamp")
                 age = f"{received-stamp/1000:.1f}秒" if isinstance(stamp, (float, int)) else "未知"
                 self.emit("status", f"{'重点' if is_watch else '扫描'} {len(data['item'])}只 | 请求{elapsed:.2f}秒 | 批次最新行情距接收{age}（不代表每只股票）")
@@ -360,6 +391,7 @@ class Monitor:
             except ApiError as e:
                 if not e.retry:
                     raise
+                self.emit("lifecycle", "retrying")
                 self.emit("status", f"{e}；退避{backoff}秒；采样中断时旧结构会重置")
                 self.stop.wait(backoff)
                 backoff = min(backoff*2, 120)
@@ -374,130 +406,9 @@ def show_event(e):
 
 
 def gui(config):
-    import tkinter as tk
-    from tkinter import messagebox, simpledialog, ttk
-    window = tk.Tk()
-    window.title("A股盘中观察 · 试验版（不自动交易）")
-    window.geometry("1000x700")
-    messages, stop = queue.Queue(), threading.Event()
-    worker = None
-    popups = {}
-    key = tk.StringVar(value=os.environ.get("FUYAO_API_KEY", ""))
-    status = tk.StringVar(value="先运行演示。阈值未经回测，实时数据权限与延迟待实测。")
-    ttk.Label(window, text="实验信号供手动复核；不会连接券商。电脑须开机、联网且不休眠。").pack(pady=8)
-    keyrow = ttk.Frame(window)
-    keyrow.pack(fill="x", padx=12)
-    ttk.Label(keyrow, text="扶摇密钥（仅本次内存）：").pack(side="left")
-    ttk.Entry(keyrow, textvariable=key, show="*", width=65).pack(side="left", fill="x", expand=True)
-    bar = ttk.Frame(window)
-    bar.pack(fill="x", padx=12, pady=10)
-    log = tk.Text(window, wrap="word", font=("Microsoft YaHei UI", 11), state="disabled")
-    log.pack(fill="both", expand=True, padx=12)
-    ttk.Label(window, textvariable=status, wraplength=950).pack(padx=12, pady=12)
-    def append(text):
-        log.configure(state="normal")
-        log.insert("end", text+"\n\n")
-        if int(log.index("end-1c").split(".")[0]) > 1500:
-            log.delete("1.0", "300.0")
-        log.see("end")
-        log.configure(state="disabled")
-    def start(mode):
-        nonlocal worker, stop
-        if worker and worker.is_alive():
-            messagebox.showinfo("正在运行", "请先停止当前监控")
-            return
-        if mode == "live" and not key.get().strip():
-            messagebox.showerror("缺少密钥", "请在上方填写密钥；不会保存到磁盘")
-            return
-        stop = threading.Event()
-        monitor = Monitor(config, lambda k, v: messages.put((k, v)), stop, key.get().strip(), mode)
-        worker = threading.Thread(target=monitor.run, daemon=True)
-        worker.start()
-    def position():
-        try:
-            code = simpledialog.askstring("手动持仓", "股票完整代码，例如600000.SH（不会自动交易）：", parent=window)
-            if not code:
-                return
-            import re
-            code = code.strip().upper()
-            if not re.fullmatch(r"(?:60[0135]\d{3}\.SH|00[0123]\d{3}\.SZ)", code):
-                raise ValueError("请输入沪深主板完整代码")
-            if messagebox.askyesno("持仓操作", "是否录入/更新持仓？选择“否”将删除该代码的持仓记录。"):
-                cost = simpledialog.askfloat("持仓成本", "实际买入均价（元）：", minvalue=0.001)
-                if cost is None:
-                    return
-                shares = simpledialog.askinteger("持仓数量", "实际持仓股数：", minvalue=1)
-                if shares is None:
-                    return
-                day = simpledialog.askstring("买入日期", "买入日期 YYYY-MM-DD：", initialvalue=str(datetime.now(CN).date()))
-                if not day:
-                    return
-                day = str(datetime.strptime(day, "%Y-%m-%d").date())
-                if day > str(datetime.now(CN).date()) or not math.isfinite(cost):
-                    raise ValueError("持仓日期或价格不合法")
-                Positions().set(code, {"cost": cost, "shares": shares, "buy_date": day})
-                append(f"已记录持仓 {code}，买入日期 {day}；仅次日起检查转弱信号。加仓跨日持仓请自行核对可卖数量。")
-            elif messagebox.askyesno("确认删除", f"确定删除 {code} 的本地持仓记录？"):
-                Positions().set(code, None)
-                append("已移除持仓 " + code)
-        except (ValueError, KeyError, OSError):
-            messagebox.showerror("持仓输入错误", "请检查代码、日期、数量、价格与文件权限")
-    ttk.Button(bar, text="运行合成数据演示", command=lambda: start("demo")).pack(side="left")
-    ttk.Button(bar, text="启动实时监控", command=lambda: start("live")).pack(side="left", padx=8)
-    ttk.Button(bar, text="停止", command=lambda: stop.set()).pack(side="left")
-    ttk.Button(bar, text="录入/移除实际持仓", command=position).pack(side="right")
-    def pump():
-        try:
-            while True:
-                kind, value = messages.get_nowait()
-                if kind == "event":
-                    # Expired queued buy messages must not be presented as actionable.
-                    if value["kind"] == "入场候选" and value["name"] != "模拟股票（非推荐）" and time.time()-value["ts"] > config["signal_expiry_seconds"]:
-                        value["kind"] = "失效"
-                        value["reason"] = "提醒队列延迟，原候选已过期"
-                    text = show_event(value)
-                    append(text)
-                    previous = popups.pop(value["code"], None)
-                    if previous:
-                        previous[0].after_cancel(previous[1])
-                        previous[0].destroy()
-                    try:
-                        if os.name == "nt":
-                            import winsound
-                            winsound.PlaySound("SystemExclamation", winsound.SND_ALIAS | winsound.SND_ASYNC)
-                        else:
-                            window.bell()
-                    except (RuntimeError, OSError):
-                        status.set("声音播放失败，请检查音量和音频设备；文字提醒继续")
-                    if value["kind"] != "失效":
-                        # Nonmodal, no focus stealing; the main log retains the event.
-                        popup = tk.Toplevel(window)
-                        popup.title(value["kind"] + " · 请手机复核")
-                        popup.attributes("-topmost", True)
-                        ttk.Label(popup, text=text, wraplength=550, padding=18).pack()
-                        def dismiss(code=value["code"]):
-                            entry = popups.pop(code, None)
-                            if entry:
-                                entry[0].after_cancel(entry[1])
-                                entry[0].destroy()
-                        ttk.Button(popup, text="知道了", command=dismiss).pack(pady=8)
-                        popup.protocol("WM_DELETE_WINDOW", dismiss)
-                        timer = popup.after(20000, dismiss)
-                        popups[value["code"]] = (popup, timer)
-                else:
-                    status.set(value)
-                    if kind == "error":
-                        append("错误：" + value)
-        except queue.Empty:
-            pass
-        window.after(150, pump)
-    def close():
-        stop.set()
-        key.set("")
-        window.destroy()
-    window.protocol("WM_DELETE_WINDOW", close)
-    pump()
-    window.mainloop()
+    import sys
+    from dashboard import run
+    run(config, sys.modules[__name__])
 
 
 def replay(path, config):
@@ -558,7 +469,8 @@ def main():
     def emit(kind, value):
         if kind == "error":
             failed.append(value)
-        print(show_event(value) if kind == "event" else value, flush=True)
+        if kind in ("event", "status", "error", "done"):
+            print(show_event(value) if kind == "event" else value, flush=True)
     try:
         Monitor(config, emit, stop, key, "demo" if args.demo else "live", args.max_cycles,
                 set(args.codes.upper().split(",")) if args.codes else None).run()
