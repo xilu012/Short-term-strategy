@@ -1,0 +1,572 @@
+"""Windows research monitor: Python standard library only; no trading API."""
+import argparse
+from dataclasses import asdict
+from datetime import datetime
+import getpass
+import json
+import math
+import os
+from pathlib import Path
+import queue
+import sqlite3
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+from strategy import CN, Engine, Tick, holding_event, main_board, market_time
+
+ROOT = Path(__file__).resolve().parent
+DATA = ROOT / "data"
+BASE = "https://fuyao.aicubes.cn"
+POSITIONS_LOCK = threading.Lock()
+
+
+def configuration(path=None):
+    c = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+    if path:
+        override = json.loads(Path(path).read_text(encoding="utf-8"))
+        if set(override)-set(c):
+            raise ValueError("配置含未知字段")
+        c.update(override)
+    for k, v in c.items():
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0:
+            raise ValueError("配置必须是有限正数: " + k)
+    for k in ("batch_size", "max_watch"):
+        if not isinstance(c[k], int):
+            raise ValueError(k + " 必须为整数")
+    if c["batch_size"] > 100 or c["max_watch"] > 100:
+        raise ValueError("试验版每批/重点观察最多100只")
+    if c["pullback_min_pct"] >= c["pullback_max_pct"] or c["min_gain_pct"] >= c["max_gain_pct"]:
+        raise ValueError("阈值上下界错误")
+    return c
+
+
+class ApiError(Exception):
+    def __init__(self, text, retry=False):
+        super().__init__(text)
+        self.retry = retry
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Never forward the API key to a redirected destination.
+        return None
+
+
+class Client:
+    def __init__(self, key):
+        if not key:
+            raise ApiError("未配置 FUYAO_API_KEY")
+        self.key = key
+        self.opener = urllib.request.build_opener(NoRedirect())
+
+    def get(self, path, **params):
+        if path not in ("/api/meta/tickers/list", "/api/a-share/prices/snapshot", "/api/a-share/auction/snapshot"):
+            raise ApiError("未允许的接口")
+        url = BASE + path + "?" + urllib.parse.urlencode(params)
+        req = urllib.request.Request(url, headers={"X-api-key": self.key, "User-Agent": "AShareResearchMonitor/0.1"})
+        started = time.monotonic()
+        try:
+            with self.opener.open(req, timeout=8) as r:
+                payload = json.loads(r.read(16*1024*1024))
+        except urllib.error.HTTPError as e:
+            raise ApiError("HTTP " + str(e.code), retry=e.code == 429 or e.code >= 500) from None
+        except (urllib.error.URLError, TimeoutError, OSError):
+            raise ApiError("网络连接失败或超时", retry=True) from None
+        except (ValueError, UnicodeError):
+            raise ApiError("接口返回非有效JSON") from None
+        code = payload.get("code") if isinstance(payload, dict) else None
+        if code != 0:
+            label = {2001: "密钥无效或缺失", 2003: "接口权限不足", 4001: "请求限流"}.get(code, "业务接口错误")
+            # No raw server error bodies: they may contain sensitive request details.
+            raise ApiError(f"{label}（code={code if isinstance(code, int) else 'unknown'}）", retry=code == 4001)
+        data = payload.get("data")
+        if not isinstance(data, dict) or not isinstance(data.get("item"), list):
+            raise ApiError("响应字段不符合文档：缺少 data.item")
+        return data, time.monotonic()-started
+
+    def universe(self, stop):
+        rows, offset = {}, 0
+        while not stop.is_set():
+            data, _ = self.get("/api/meta/tickers/list", asset_type="a-share", limit=1000, offset=offset)
+            for item in data["item"]:
+                if main_board(item):
+                    rows[item["thscode"]] = item
+            if len(data["item"]) < 1000:
+                return rows
+            offset += 1000
+            if offset > 20000:
+                raise ApiError("代码表分页异常")
+            stop.wait(1)
+        return rows
+
+
+class Storage:
+    def __init__(self, mode):
+        DATA.mkdir(exist_ok=True)
+        self.db = sqlite3.connect(DATA / ("demo.sqlite3" if mode == "demo" else "market.sqlite3"))
+        self.db.execute("CREATE TABLE IF NOT EXISTS frames (id INTEGER PRIMARY KEY, received REAL, kind TEXT, batch_ms INTEGER, elapsed REAL, payload TEXT)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, received REAL, payload TEXT)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS sessions (started REAL, mode TEXT, config TEXT)")
+
+    def session(self, mode, config):
+        self.db.execute("INSERT INTO sessions VALUES (?,?,?)", (time.time(), mode, json.dumps(config)))
+        self.db.commit()
+
+    def frame(self, kind, data, received, elapsed):
+        self.db.execute("INSERT INTO frames(received,kind,batch_ms,elapsed,payload) VALUES (?,?,?,?,?)",
+                        (received, kind, data.get("timestamp"), elapsed, json.dumps(data, ensure_ascii=False)))
+        self.db.commit()
+
+    def event(self, event):
+        self.db.execute("INSERT INTO events(received,payload) VALUES (?,?)", (event.ts, json.dumps(asdict(event), ensure_ascii=False)))
+        self.db.commit()
+
+    def close(self):
+        self.db.close()
+
+
+class Positions:
+    def __init__(self):
+        DATA.mkdir(exist_ok=True)
+        self.path = DATA / "positions.json"
+        self.lock = POSITIONS_LOCK
+
+    def read(self):
+        if not self.path.exists():
+            return {}
+        result = json.loads(self.path.read_text(encoding="utf-8"))
+        if not isinstance(result, dict):
+            raise ValueError("持仓文件格式错误")
+        for code, p in result.items():
+            datetime.strptime(p["buy_date"], "%Y-%m-%d")
+            if not math.isfinite(p["cost"]) or p["cost"] <= 0 or p["shares"] <= 0:
+                raise ValueError("持仓数据无效: " + code)
+        return result
+
+    def write(self, rows):
+        temp = self.path.with_suffix(".tmp")
+        temp.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp.replace(self.path)
+
+    def set(self, code, position):
+        with self.lock:
+            rows = self.read()
+            if position is None:
+                rows.pop(code, None)
+            else:
+                rows[code] = position
+            self.write(rows)
+
+
+def session_phase(now):
+    if now.weekday() >= 5:
+        return "closed"
+    clock = now.strftime("%H:%M:%S")
+    if "09:25:00" <= clock < "09:30:00":
+        return "auction"
+    if "09:30:00" <= clock < "11:30:00" or "13:00:00" <= clock < "15:00:00":
+        return "market"
+    return "closed"
+
+
+def demo_ticks():
+    start = datetime(2026, 10, 26, 10, 0, tzinfo=CN).timestamp()
+    prices = [10.30, 10.36, 10.44, 10.52, 10.60, 10.56, 10.52, 10.50,
+              10.50, 10.51, 10.51, 10.51, 10.52, 10.57, 10.59, 10.48]
+    increments = [10000]*5 + [1000]*8 + [20000]*3
+    volume = 100000
+    turnover = 1000000
+    for i, (price, delta) in enumerate(zip(prices, increments)):
+        volume += delta
+        turnover += price*delta
+        ts = start+i*5
+        yield Tick("600000.SH", "模拟股票（非推荐）", ts, int(ts*1000), price, volume, turnover, 10, 10.3)
+
+
+class Monitor:
+    def __init__(self, config, emit, stop, key="", mode="live", max_cycles=None, codes=None):
+        self.c, self.emit, self.stop = config, emit, stop
+        self.key, self.mode, self.max_cycles = key, mode, max_cycles
+        self.codes = codes
+        self.engine = Engine(config)
+        self.positions = Positions()
+        self.store = None
+
+    def send_event(self, event):
+        self.store.event(event)
+        self.emit("event", asdict(event))
+
+    def consume(self, data, received, names, held):
+        stamp = data.get("timestamp")
+        if not isinstance(stamp, (int, float)) or not math.isfinite(stamp):
+            self.emit("status", "批次缺少有效行情时间，已存档但不生成信号")
+            return
+        age = received-stamp/1000
+        if age > self.c["max_batch_age_seconds"] or age < -5:
+            self.emit("status", f"批次行情时间异常/过旧（{age:.1f}秒），不生成信号")
+            return
+        with self.positions.lock:
+            positions = self.positions.read()
+            for row in data["item"]:
+                code = row.get("thscode")
+                if code not in names:
+                    continue
+                try:
+                    t = Tick.parse(row, received, stamp, names[code]["name"])
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    self.emit("status", f"跳过无效行情: {code}")
+                    continue
+                if code not in held:
+                    for e in self.engine.feed(t):
+                        self.send_event(e)
+                if code in positions:
+                    e = holding_event(positions[code], t, self.c)
+                    if e:
+                        self.send_event(e)
+            if positions:
+                self.positions.write(positions)
+
+    def run(self):
+        try:
+            self.store = Storage(self.mode)
+            self.store.session(self.mode, self.c)
+            if self.mode == "demo":
+                for t in demo_ticks():
+                    if self.stop.is_set():
+                        break
+                    self.store.frame("demo", {"timestamp": t.batch_ms, "item": [asdict(t)]}, t.ts, 0)
+                    self.emit("status", f"演示 {market_time(t.ts):%H:%M:%S} 价格 {t.price:.2f}，使用合成数据")
+                    for e in self.engine.feed(t):
+                        self.send_event(e)
+                    self.stop.wait(0.35)
+                return
+            client = Client(self.key)
+            names = client.universe(self.stop)
+            if self.codes:
+                names = {k: v for k, v in names.items() if k in self.codes}
+            if not names:
+                raise ApiError("没有符合主板、非ST、上市满60自然日条件的股票，或代码表权限/字段不满足要求")
+            self.emit("status", f"股票池 {len(names)} 只；重点观察最多 {self.c['max_watch']} 只；尚未验证交易效果")
+            self.loop(client, names)
+        except ApiError as e:
+            self.emit("error", str(e))
+        except Exception as e:
+            # Deliberately no exception text/traceback containing headers or secrets.
+            self.emit("error", f"本地处理失败（{type(e).__name__}），请检查配置、持仓文件及磁盘权限")
+        finally:
+            self.key = ""
+            if self.store:
+                self.store.close()
+            self.emit("done", "监控已停止")
+
+    def loop(self, client, names):
+        codes = sorted(names)
+        cursor, candidates, auction_done = 0, {}, set()
+        next_watch = next_scan = 0
+        day = None
+        backoff, cycles = 2, 0
+        scan_started = time.monotonic()
+        while not self.stop.is_set():
+            now = datetime.now(CN)
+            if str(now.date()) != day:
+                if day is not None:
+                    # Refresh stock names/ST/listing status every trading day; fail closed on error.
+                    raise ApiError("交易日已变化，请重新启动以刷新股票池与ST状态")
+                day = str(now.date())
+            phase = session_phase(now)
+            if phase == "closed":
+                self.emit("status", "非连续交易/竞价时段，暂停请求；节假日另以行情新鲜度拦截")
+                self.stop.wait(30)
+                continue
+            try:
+                with self.positions.lock:
+                    held = set(self.positions.read())
+                if held-set(names):
+                    raise ApiError("持仓含当前股票池以外代码；请清理或另行人工监控，程序不静默忽略")
+                mono = time.monotonic()
+                if phase == "auction":
+                    batch = [k for k in codes if k not in auction_done][:self.c["batch_size"]]
+                    if not batch:
+                        self.stop.wait(5)
+                        continue
+                    data, elapsed = client.get("/api/a-share/auction/snapshot", thscodes=",".join(batch), stage="final")
+                    received = time.time()
+                    self.store.frame("auction", data, received, elapsed)
+                    if data.get("data_status") == "ready":
+                        auction_done.update(batch)
+                        for row in data["item"]:
+                            code = row.get("thscode")
+                            pct = row.get("auction_pct")
+                            if code in names and isinstance(pct, (int, float)) and pct >= self.c["candidate_gap_pct"]:
+                                candidates[code] = (pct, received)
+                        self.emit("status", f"竞价已记录 {len(auction_done)}/{len(codes)} 只；只入观察池，不发买入信号")
+                    else:
+                        self.emit("status", "竞价终态尚未就绪，稍后重试")
+                        self.stop.wait(5)
+                    self.stop.wait(self.c["scan_interval_seconds"])
+                    continue
+                # Holdings take priority; candidate list is refreshed by rolling market scans.
+                candidates = {k: v for k, v in candidates.items() if time.time()-v[1] < 300}
+                ranked = sorted(candidates, key=lambda k: candidates[k][0], reverse=True)
+                watch = sorted(held) + [k for k in ranked if k not in held][:max(0, self.c["max_watch"]-len(held))]
+                if len(held) > self.c["max_watch"]:
+                    raise ApiError("持仓数量超过重点观察上限")
+                is_watch = bool(watch) and mono >= next_watch
+                if is_watch:
+                    batch = watch
+                    next_watch = mono+self.c["watch_interval_seconds"]
+                elif mono >= next_scan:
+                    batch = codes[cursor:cursor+self.c["batch_size"]]
+                    cursor += len(batch)
+                    next_scan = mono+self.c["scan_interval_seconds"]
+                    if cursor >= len(codes):
+                        cursor = 0
+                        self.emit("status", f"一轮全池扫描调度耗时 {mono-scan_started:.1f}秒；重点池 {len(watch)}只")
+                        scan_started = mono
+                else:
+                    self.stop.wait(0.2)
+                    continue
+                data, elapsed = client.get("/api/a-share/prices/snapshot", thscodes=",".join(batch))
+                received = time.time()
+                data["_context"] = {"held": sorted(held), "names": {k: names[k]["name"] for k in batch}}
+                self.store.frame("watch" if is_watch else "scan", data, received, elapsed)
+                for row in data["item"]:
+                    code = row.get("thscode")
+                    if code not in names:
+                        continue
+                    try:
+                        prev, price, opening = (float(row[k]) for k in ("prev_price", "last_price", "open_price"))
+                        gain, gap = (price/prev-1)*100, (opening/prev-1)*100
+                        if not all(math.isfinite(v) for v in (gain, gap)):
+                            continue
+                        if (gain >= self.c["candidate_gain_pct"] or gap >= self.c["candidate_gap_pct"]) and gain < self.c["max_gain_pct"]:
+                            candidates[code] = (gain+max(gap, 0)*0.2, received)
+                        else:
+                            candidates.pop(code, None)
+                    except (ValueError, TypeError, KeyError, ZeroDivisionError):
+                        continue
+                self.consume(data, received, names, held)
+                stamp = data.get("timestamp")
+                age = f"{received-stamp/1000:.1f}秒" if isinstance(stamp, (float, int)) else "未知"
+                self.emit("status", f"{'重点' if is_watch else '扫描'} {len(data['item'])}只 | 请求{elapsed:.2f}秒 | 批次最新行情距接收{age}（不代表每只股票）")
+                cycles += 1
+                backoff = 2
+                if self.max_cycles and cycles >= self.max_cycles:
+                    return
+                self.stop.wait(0.5)  # Serial requests; never burst retries.
+            except ApiError as e:
+                if not e.retry:
+                    raise
+                self.emit("status", f"{e}；退避{backoff}秒；采样中断时旧结构会重置")
+                self.stop.wait(backoff)
+                backoff = min(backoff*2, 120)
+
+
+def show_event(e):
+    clock = market_time(e["ts"]).strftime("%H:%M:%S")
+    batch = market_time(e["batch_ms"]/1000).strftime("%H:%M:%S") if e["batch_ms"] else "未知"
+    return (f"[{e['kind']}] {e['name']} {e['code']}  ¥{e['price']:.2f}\n"
+            f"信号接收时间 {clock}｜批次最新行情 {batch}\n{e['reason']}" +
+            (f"\n承接低点参考 ¥{e['low']:.2f}" if e["low"] else ""))
+
+
+def gui(config):
+    import tkinter as tk
+    from tkinter import messagebox, simpledialog, ttk
+    window = tk.Tk()
+    window.title("A股盘中观察 · 试验版（不自动交易）")
+    window.geometry("1000x700")
+    messages, stop = queue.Queue(), threading.Event()
+    worker = None
+    popups = {}
+    key = tk.StringVar(value=os.environ.get("FUYAO_API_KEY", ""))
+    status = tk.StringVar(value="先运行演示。阈值未经回测，实时数据权限与延迟待实测。")
+    ttk.Label(window, text="实验信号供手动复核；不会连接券商。电脑须开机、联网且不休眠。").pack(pady=8)
+    keyrow = ttk.Frame(window)
+    keyrow.pack(fill="x", padx=12)
+    ttk.Label(keyrow, text="扶摇密钥（仅本次内存）：").pack(side="left")
+    ttk.Entry(keyrow, textvariable=key, show="*", width=65).pack(side="left", fill="x", expand=True)
+    bar = ttk.Frame(window)
+    bar.pack(fill="x", padx=12, pady=10)
+    log = tk.Text(window, wrap="word", font=("Microsoft YaHei UI", 11), state="disabled")
+    log.pack(fill="both", expand=True, padx=12)
+    ttk.Label(window, textvariable=status, wraplength=950).pack(padx=12, pady=12)
+    def append(text):
+        log.configure(state="normal")
+        log.insert("end", text+"\n\n")
+        if int(log.index("end-1c").split(".")[0]) > 1500:
+            log.delete("1.0", "300.0")
+        log.see("end")
+        log.configure(state="disabled")
+    def start(mode):
+        nonlocal worker, stop
+        if worker and worker.is_alive():
+            messagebox.showinfo("正在运行", "请先停止当前监控")
+            return
+        if mode == "live" and not key.get().strip():
+            messagebox.showerror("缺少密钥", "请在上方填写密钥；不会保存到磁盘")
+            return
+        stop = threading.Event()
+        monitor = Monitor(config, lambda k, v: messages.put((k, v)), stop, key.get().strip(), mode)
+        worker = threading.Thread(target=monitor.run, daemon=True)
+        worker.start()
+    def position():
+        try:
+            code = simpledialog.askstring("手动持仓", "股票完整代码，例如600000.SH（不会自动交易）：", parent=window)
+            if not code:
+                return
+            import re
+            code = code.strip().upper()
+            if not re.fullmatch(r"(?:60[0135]\d{3}\.SH|00[0123]\d{3}\.SZ)", code):
+                raise ValueError("请输入沪深主板完整代码")
+            if messagebox.askyesno("持仓操作", "是否录入/更新持仓？选择“否”将删除该代码的持仓记录。"):
+                cost = simpledialog.askfloat("持仓成本", "实际买入均价（元）：", minvalue=0.001)
+                if cost is None:
+                    return
+                shares = simpledialog.askinteger("持仓数量", "实际持仓股数：", minvalue=1)
+                if shares is None:
+                    return
+                day = simpledialog.askstring("买入日期", "买入日期 YYYY-MM-DD：", initialvalue=str(datetime.now(CN).date()))
+                if not day:
+                    return
+                day = str(datetime.strptime(day, "%Y-%m-%d").date())
+                if day > str(datetime.now(CN).date()) or not math.isfinite(cost):
+                    raise ValueError("持仓日期或价格不合法")
+                Positions().set(code, {"cost": cost, "shares": shares, "buy_date": day})
+                append(f"已记录持仓 {code}，买入日期 {day}；仅次日起检查转弱信号。加仓跨日持仓请自行核对可卖数量。")
+            elif messagebox.askyesno("确认删除", f"确定删除 {code} 的本地持仓记录？"):
+                Positions().set(code, None)
+                append("已移除持仓 " + code)
+        except (ValueError, KeyError, OSError):
+            messagebox.showerror("持仓输入错误", "请检查代码、日期、数量、价格与文件权限")
+    ttk.Button(bar, text="运行合成数据演示", command=lambda: start("demo")).pack(side="left")
+    ttk.Button(bar, text="启动实时监控", command=lambda: start("live")).pack(side="left", padx=8)
+    ttk.Button(bar, text="停止", command=lambda: stop.set()).pack(side="left")
+    ttk.Button(bar, text="录入/移除实际持仓", command=position).pack(side="right")
+    def pump():
+        try:
+            while True:
+                kind, value = messages.get_nowait()
+                if kind == "event":
+                    # Expired queued buy messages must not be presented as actionable.
+                    if value["kind"] == "入场候选" and value["name"] != "模拟股票（非推荐）" and time.time()-value["ts"] > config["signal_expiry_seconds"]:
+                        value["kind"] = "失效"
+                        value["reason"] = "提醒队列延迟，原候选已过期"
+                    text = show_event(value)
+                    append(text)
+                    previous = popups.pop(value["code"], None)
+                    if previous:
+                        previous[0].after_cancel(previous[1])
+                        previous[0].destroy()
+                    try:
+                        if os.name == "nt":
+                            import winsound
+                            winsound.PlaySound("SystemExclamation", winsound.SND_ALIAS | winsound.SND_ASYNC)
+                        else:
+                            window.bell()
+                    except (RuntimeError, OSError):
+                        status.set("声音播放失败，请检查音量和音频设备；文字提醒继续")
+                    if value["kind"] != "失效":
+                        # Nonmodal, no focus stealing; the main log retains the event.
+                        popup = tk.Toplevel(window)
+                        popup.title(value["kind"] + " · 请手机复核")
+                        popup.attributes("-topmost", True)
+                        ttk.Label(popup, text=text, wraplength=550, padding=18).pack()
+                        def dismiss(code=value["code"]):
+                            entry = popups.pop(code, None)
+                            if entry:
+                                entry[0].after_cancel(entry[1])
+                                entry[0].destroy()
+                        ttk.Button(popup, text="知道了", command=dismiss).pack(pady=8)
+                        popup.protocol("WM_DELETE_WINDOW", dismiss)
+                        timer = popup.after(20000, dismiss)
+                        popups[value["code"]] = (popup, timer)
+                else:
+                    status.set(value)
+                    if kind == "error":
+                        append("错误：" + value)
+        except queue.Empty:
+            pass
+        window.after(150, pump)
+    def close():
+        stop.set()
+        key.set("")
+        window.destroy()
+    window.protocol("WM_DELETE_WINDOW", close)
+    pump()
+    window.mainloop()
+
+
+def replay(path, config):
+    # Read-only replay of raw quotes; no fills, profits or success-rate claims.
+    db = sqlite3.connect(Path(path).resolve().as_uri()+"?mode=ro", uri=True)
+    engine, counts = Engine(config), {}
+    try:
+        for received, batch_ms, payload in db.execute("SELECT received,batch_ms,payload FROM frames WHERE kind IN ('scan','watch') ORDER BY received,id"):
+            if not batch_ms or not -5 <= received-batch_ms/1000 <= config["max_batch_age_seconds"]:
+                continue
+            data = json.loads(payload)
+            context = data.get("_context", {})
+            for row in data["item"]:
+                if row.get("thscode") in context.get("held", []):
+                    continue
+                try:
+                    t = Tick.parse(row, received, batch_ms, context.get("names", {}).get(row["thscode"], row["thscode"]))
+                except (KeyError, ValueError, TypeError):
+                    continue
+                for e in engine.feed(t):
+                    counts[e.kind] = counts.get(e.kind, 0)+1
+                    print(show_event(asdict(e)), "\n")
+    finally:
+        db.close()
+    print("信号回放数量（不是交易回测）：", json.dumps(counts, ensure_ascii=False))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--demo", action="store_true", help="合成数据控制台演示，无需密钥")
+    mode.add_argument("--live", action="store_true", help="控制台实时监控")
+    mode.add_argument("--probe", action="store_true", help="仅请求一次单股行情，检查权限与字段")
+    mode.add_argument("--replay", metavar="SQLITE", help="回放自己采集的原始行情，不计算收益")
+    parser.add_argument("--config", help="JSON配置覆盖文件")
+    parser.add_argument("--max-cycles", type=int)
+    parser.add_argument("--codes", help="仅监控指定主板股票，逗号分隔；默认滚动扫描全池")
+    args = parser.parse_args()
+    config = configuration(args.config)
+    if args.replay:
+        replay(args.replay, config)
+        return
+    if not (args.demo or args.live or args.probe):
+        gui(config)
+        return
+    key = ""
+    if not args.demo:
+        key = os.environ.get("FUYAO_API_KEY", "") or getpass.getpass("扶摇密钥（不回显、不保存）：")
+    if args.probe:
+        try:
+            data, elapsed = Client(key).get("/api/a-share/prices/snapshot", thscodes="600000.SH")
+            print(json.dumps({"elapsed_seconds": round(elapsed, 3), "data": data}, ensure_ascii=False, indent=2))
+        except ApiError as e:
+            parser.exit(1, str(e)+"\n")
+        return
+    stop = threading.Event()
+    failed = []
+    def emit(kind, value):
+        if kind == "error":
+            failed.append(value)
+        print(show_event(value) if kind == "event" else value, flush=True)
+    try:
+        Monitor(config, emit, stop, key, "demo" if args.demo else "live", args.max_cycles,
+                set(args.codes.upper().split(",")) if args.codes else None).run()
+    except KeyboardInterrupt:
+        stop.set()
+    if failed:
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
