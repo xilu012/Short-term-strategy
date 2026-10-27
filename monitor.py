@@ -33,12 +33,12 @@ def configuration(path=None):
     for k, v in c.items():
         if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0:
             raise ValueError("配置必须是有限正数: " + k)
-    for k in ("batch_size", "max_watch"):
+    for k in ("batch_size", "max_watch", "min_rise_samples", "min_stable_updates", "rebound_confirm_updates", "max_failed_breakouts"):
         if not isinstance(c[k], int):
             raise ValueError(k + " 必须为整数")
     if c["batch_size"] > 100 or c["max_watch"] > 100:
         raise ValueError("试验版每批/重点观察最多100只")
-    if c["pullback_min_pct"] >= c["pullback_max_pct"] or c["min_gain_pct"] >= c["max_gain_pct"]:
+    if c["pullback_min_pct"] >= c["pullback_max_pct"] or c["min_rise_retention_ratio"] > 1:
         raise ValueError("阈值上下界错误")
     return c
 
@@ -204,11 +204,12 @@ class Monitor:
         last = history[-2] if len(history) > 1 else None
         rate = (t.volume-last.volume)/(t.ts-last.ts) if last and t.ts > last.ts else None
         return dict(**asdict(t), phase=s.phase if s else "search", ready=bool(s and s.watch_sent),
-                    speed=speed, volume_ratio=rate/max(1, s.pull_rate) if s and s.pull_rate and rate is not None else None,
+                    speed=speed, volume_ratio=s.last_ratio if s and s.last_ratio else None,
                     pullback=(1-t.price/s.peak)*100 if s and s.peak else None,
                     vwap=t.turnover/t.volume if t.volume else None,
                     distance=(limit_price(t.prev)/t.price-1)*100,
-                    low=s.low if s else None, position=dict(position) if position else None)
+                    low=s.low if s else None, confirming=bool(s and s.confirm_updates),
+                    position=dict(position) if position else None)
 
     def send_event(self, event):
         self.store.event(event)
@@ -369,7 +370,7 @@ class Monitor:
                         gain, gap = (price/prev-1)*100, (opening/prev-1)*100
                         if not all(math.isfinite(v) for v in (gain, gap)):
                             continue
-                        if (gain >= self.c["candidate_gain_pct"] or gap >= self.c["candidate_gap_pct"]) and gain < self.c["max_gain_pct"]:
+                        if gain >= self.c["candidate_gain_pct"] or gap >= self.c["candidate_gap_pct"]:
                             candidates[code] = (gain+max(gap, 0)*0.2, received)
                         else:
                             candidates.pop(code, None)

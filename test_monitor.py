@@ -42,6 +42,62 @@ class StrategyTests(unittest.TestCase):
             events.extend(engine.feed(replace(t, volume=volume, turnover=turnover)))
         self.assertNotIn("入场候选", [e.kind for e in events])
 
+    def test_single_spike_cannot_be_entry(self):
+        engine = Engine(self.c)
+        events = [e for t in self.ticks[:14] for e in engine.feed(t)]
+        self.assertIn("观察", [e.kind for e in events])
+        self.assertNotIn("入场候选", [e.kind for e in events])
+        self.assertEqual(engine.states[self.ticks[0].code].confirm_updates, 1)
+
+    def test_near_limit_keeps_structural_entry(self):
+        engine = Engine(self.c)
+        events = []
+        for t in self.ticks:
+            price = 10.55+(t.price-10.3)*1.45
+            events.extend(engine.feed(replace(t, price=price)))
+        buys = [e for e in events if e.kind == "入场候选"]
+        self.assertEqual(len(buys), 1)
+        self.assertGreater(buys[0].metrics["gain"], 9.5)
+        self.assertGreater(buys[0].metrics["distance_pct"], 0)
+
+    def test_sparse_updates_cannot_confirm_support(self):
+        engine = Engine(self.c)
+        for t in self.ticks[:8]:
+            engine.feed(t)
+        events = []
+        for i, t in enumerate(self.ticks[8:]):
+            events.extend(engine.feed(replace(t, ts=self.ticks[7].ts+(i+1)*20)))
+        self.assertNotIn("入场候选", [e.kind for e in events])
+
+    def test_rebound_needs_absolute_turnover(self):
+        engine = Engine(self.c | {"min_rebound_amount": 100000000})
+        self.assertNotIn("入场候选", [e.kind for t in self.ticks for e in engine.feed(t)])
+
+    def test_signal_metrics_capture_causal_evidence(self):
+        engine = Engine(self.c)
+        event = next(e for t in self.ticks for e in engine.feed(t) if e.kind == "入场候选")
+        self.assertGreaterEqual(event.metrics["confirmed_updates"], 2)
+        self.assertGreaterEqual(event.metrics["stable_updates"], 3)
+        self.assertGreaterEqual(event.metrics["volume_ratio"], self.c["rebound_volume_ratio"])
+
+    def test_holding_structure_break_and_review_deadline(self):
+        p = dict(buy_date="2026-10-23", cost=10.3, shares=100)
+        for t in self.ticks[:4]:
+            holding_event(p, replace(t, price=10.3, turnover=t.volume*10.5), self.c)
+        event = holding_event(p, replace(self.ticks[4], price=10.2, turnover=self.ticks[4].volume*10.5), self.c)
+        self.assertEqual(event.kind, "持仓转弱")
+        p = dict(buy_date="2026-10-23", cost=10, shares=100)
+        late = datetime(2026, 10, 26, 10, 31, tzinfo=CN).timestamp()
+        event = holding_event(p, replace(self.ticks[0], ts=late, price=10.2, opening=10.4, turnover=self.ticks[0].volume*10.3), self.c)
+        self.assertEqual(event.kind, "持仓复核")
+
+    def test_holding_risk_not_blocked_by_prior_lower_priority_alert(self):
+        p = dict(buy_date="2026-10-23", cost=10, shares=100)
+        t = self.ticks[0]
+        holding_event(p, replace(t, price=10.8), self.c)
+        self.assertEqual(holding_event(p, replace(t, ts=t.ts+10, price=10.5), self.c).kind, "持仓转弱")
+        self.assertEqual(holding_event(p, replace(t, ts=t.ts+15, price=9.4), self.c).kind, "持仓风险")
+
     def test_observation_gap_discards_old_setup(self):
         engine = Engine(self.c)
         for t in self.ticks[:13]:
@@ -52,9 +108,9 @@ class StrategyTests(unittest.TestCase):
 
     def test_cached_quote_expires_and_cannot_confirm_stability(self):
         engine = Engine(self.c)
-        for t in self.ticks[:14]:
+        for t in self.ticks[:15]:
             engine.feed(t)
-        last = self.ticks[13]
+        last = self.ticks[14]
         events = engine.feed(replace(last, ts=last.ts+31))
         self.assertEqual([e.kind for e in events], ["失效"])
         engine = Engine(self.c)
@@ -117,8 +173,8 @@ class StrategyTests(unittest.TestCase):
         p = dict(buy_date="2026-10-23", cost=10, shares=100)
         t = replace(self.ticks[0], price=9.4)
         early = datetime(2026, 10, 26, 9, 31, tzinfo=CN).timestamp()
-        self.assertIsNone(holding_event(p, replace(t, ts=early), self.c))
-        self.assertEqual(holding_event(p, t, self.c).kind, "持仓转弱")
+        self.assertEqual(holding_event(p, replace(t, ts=early), self.c).kind, "持仓风险")
+        self.assertEqual(holding_event(p, t, self.c).kind, "持仓风险")
 
     def test_tick_rejects_invalid_numbers(self):
         row = dict(thscode="600000.SH", last_price=float("nan"), volume=1, turnover=1, prev_price=10, open_price=10)

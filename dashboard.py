@@ -77,13 +77,13 @@ class DashboardModel:
         if stage == "入场候选" and event and clock-event["ts"] > self.config["signal_expiry_seconds"]:
             return "已过期"
         if row.get("phase") == "pullback" and row.get("ready"):
-            return "承接观察"
+            return "突破确认" if row.get("confirming") else "承接观察"
         return stage
 
     def rows(self, selection="全部候选", search="", now=None):
         now = now or time.time()
         result = []
-        priority = {"入场候选": 0, "承接观察": 1, "回落观察": 2, "快速拉升": 3}
+        priority = {"入场候选": 0, "突破确认": 1, "承接观察": 2, "回落观察": 3, "快速拉升": 4}
         for row in self.quotes.values():
             code = row["code"]
             if search and search.casefold() not in (row["name"]+code).casefold():
@@ -181,7 +181,7 @@ class Dashboard:
         controls = ttk.Frame(left)
         controls.pack(fill="x", pady=(0, 8))
         combo = ttk.Combobox(controls, state="readonly", textvariable=self.filter, width=13,
-                             values=("全部候选", "入场候选", "承接观察", "回落观察", "快速拉升", "持仓"))
+                             values=("全部候选", "入场候选", "突破确认", "承接观察", "回落观察", "快速拉升", "持仓"))
         combo.pack(side="left")
         combo.bind("<<ComboboxSelected>>", lambda _: self.mark_dirty())
         ttk.Entry(controls, textvariable=self.search, width=20).pack(side="left", padx=8)
@@ -318,6 +318,7 @@ class Dashboard:
         position = row.get("position")
         if position:
             reason += f"\n持仓 {position['shares']}股 · 成本 {position['cost']:.2f} · 浮盈亏 {(row['price']/position['cost']-1)*100:+.2f}%"
+            reason += "\n"+position.get("status", "等待行情")
         self.detail_reason.set(reason)
         self.draw_chart()
 
