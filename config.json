@@ -33,5 +33,13 @@
   "max_failed_breakouts": 2,
   "sell_review_after_minutes": 60,
   "context_interval_seconds": 120,
-  "context_enabled": true
+  "context_enabled": true,
+  "entry_valid_seconds": 20,
+  "entry_slippage_pct": 0.2,
+  "entry_max_batch_age_seconds": 10,
+  "entry_max_request_seconds": 3,
+  "entry_account_capital": 50000,
+  "entry_max_positions": 2,
+  "entry_position_fraction": 0.3333333333333333,
+  "entry_fee_reserve": 50
 }

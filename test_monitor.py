@@ -250,10 +250,15 @@ class RuntimeTests(unittest.TestCase):
             try:
                 for t in monitor.demo_ticks():
                     row = dict(thscode=t.code, last_price=t.price, volume=t.volume, turnover=t.turnover, prev_price=t.prev, open_price=t.opening)
-                    m.consume(dict(timestamp=t.batch_ms, item=[row]), t.ts, names, set())
+                    m.consume(dict(timestamp=t.batch_ms, item=[row]), t.ts, names, set(), elapsed=0.1, record_kind="watch")
                 events = [v["kind"] for k, v in messages if k == "event"]
-                self.assertEqual(events, ["观察", "入场候选", "失效"])
-                self.assertEqual(m.store.db.execute("SELECT count(*) FROM events").fetchone()[0], 3)
+                self.assertEqual(events, ["观察", "入场候选", "买入提醒", "买入取消", "失效"])
+                self.assertEqual(m.store.db.execute("SELECT count(*) FROM events").fetchone()[0], 5)
+                buy = next(v for k,v in messages if k == "event" and v["kind"] == "买入提醒")
+                self.assertEqual(buy["metrics"]["execution"]["max_price"], 10.61)
+                self.assertFalse(m.positions.read())  # A reminder is never a simulated fill.
+                payload = m.store.db.execute("SELECT payload FROM frames ORDER BY id LIMIT 1").fetchone()[0]
+                self.assertEqual(json.loads(payload)["_context"]["positions"], {})
             finally:
                 m.store.close()
 
@@ -276,7 +281,9 @@ class RuntimeTests(unittest.TestCase):
             with contextlib.redirect_stdout(result):
                 monitor.replay(Path(directory)/"market.sqlite3", monitor.configuration())
             self.assertIn("[观察]", result.getvalue())
-            self.assertIn("[入场候选]", result.getvalue())
+            self.assertIn("[结构确认]", result.getvalue())
+            self.assertIn("[买入提醒]", result.getvalue())
+            self.assertIn("[买入取消]", result.getvalue())
             self.assertIn("[失效]", result.getvalue())
 
     def test_configuration_rejects_invalid_values(self):
@@ -286,6 +293,19 @@ class RuntimeTests(unittest.TestCase):
                 path.write_text(json.dumps(value))
                 with self.assertRaises(ValueError):
                     monitor.configuration(path)
+
+    def test_legacy_replay_with_incomplete_holdings_does_not_invent_cash(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(monitor, "DATA", Path(directory)):
+            store = monitor.Storage("live")
+            for t in monitor.demo_ticks():
+                row = dict(thscode=t.code, last_price=t.price, volume=t.volume, turnover=t.turnover, prev_price=t.prev, open_price=t.opening)
+                store.frame("watch", dict(timestamp=t.batch_ms, item=[row], _context=dict(held=["600001.SH"])), t.ts, 0.1)
+            store.close()
+            result = io.StringIO()
+            with contextlib.redirect_stdout(result):
+                monitor.replay(Path(directory)/"market.sqlite3", monitor.configuration())
+            self.assertIn("[执行暂缓]", result.getvalue())
+            self.assertNotIn("[买入提醒]", result.getvalue())
 
 
 if __name__ == "__main__":

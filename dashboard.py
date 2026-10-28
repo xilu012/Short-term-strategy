@@ -9,10 +9,11 @@ import threading
 import time
 
 from strategy import CN, market_time
+from execution import invalid_reason
 
 BG, PANEL, TEXT, MUTED = "#101827", "#192438", "#e8eef7", "#95a7bf"
 RED, GREEN, AMBER, BLUE = "#ff767d", "#5bd3a2", "#f5c66e", "#6ea8fe"
-STAGES = {"search": "扫描", "rising": "快速拉升", "pullback": "回落观察", "signaled": "入场候选", "cooldown": "已失效"}
+STAGES = {"search": "扫描", "rising": "快速拉升", "pullback": "回落观察", "signaled": "结构确认", "cooldown": "已失效"}
 STATES = {"idle": "尚未启动", "loading": "连接数据源", "running": "监控中", "demo": "演示中", "stale": "行情过旧 · 暂停信号",
           "paused": "休市等待", "retrying": "连接重试", "stopping": "正在停止", "stopped": "已停止", "error": "连接异常"}
 
@@ -31,6 +32,7 @@ class DashboardModel:
     def clear(self, mode):
         self.mode, self.state, self.day = mode, "idle", None
         self.quotes, self.histories, self.latest = {}, {}, {}
+        self.plans = {}
         self.events = deque(maxlen=500)
         self.counts = Counter()
         self.stats, self.context = {}, {}
@@ -42,18 +44,28 @@ class DashboardModel:
             for row in value:
                 day = market_time(row["ts"]).date()
                 if self.day is not None and day != self.day:
-                    self.quotes.clear(); self.histories.clear(); self.latest.clear(); self.counts.clear()
+                    self.quotes.clear(); self.histories.clear(); self.latest.clear(); self.counts.clear(); self.plans.clear()
                 self.day = day
                 code = row["code"]
                 old = self.quotes.get(code)
                 self.quotes[code] = row
+                if row.get("execution"):
+                    self.plans[code] = row["execution"]
                 history = self.histories.setdefault(code, deque(maxlen=360))
                 if not old or (old["price"], old["volume"], old["turnover"]) != (row["price"], row["volume"], row["turnover"]):
                     history.append({k: row.get(k) for k in ("ts", "price", "volume", "turnover", "vwap")})
         elif kind == "event":
+            entry_quote = value.get("metrics", {}).get("execution_quote")
+            if entry_quote:
+                row = dict(self.quotes.get(value["code"], {}), **entry_quote)
+                row.update(phase="signaled", position=None)
+                self.ingest("quotes", [row])
             self.latest[value["code"]] = value
             self.events.appendleft(value)
             self.counts[value["kind"]] += 1
+            plan = value.get("metrics", {}).get("execution")
+            if plan:
+                self.plans[value["code"]] = plan
         elif kind == "stats":
             self.stats.update(value)
         elif kind == "context":
@@ -80,18 +92,40 @@ class DashboardModel:
         if self.mode != "demo" and now-row["ts"] > self.config["max_batch_age_seconds"]:
             return "待更新"
         stage = STAGES.get(row.get("phase"), "扫描")
+        plan = self.plans.get(row["code"])
+        if plan:
+            why = self.plan_reason(plan, now)
+            if not why:
+                return "买入提醒"
+            if stage == "结构确认":
+                return "执行暂缓" if plan["status"] == "blocked" else "已取消"
         event = self.latest.get(row["code"])
         clock = row["ts"] if self.mode == "demo" else now
-        if stage == "入场候选" and event and clock-event["ts"] > self.config["signal_expiry_seconds"]:
+        if stage == "结构确认" and event and clock-event["ts"] > self.config["signal_expiry_seconds"]:
             return "已过期"
         if row.get("phase") == "pullback" and row.get("ready"):
             return "突破确认" if row.get("confirming") else "承接观察"
         return stage
 
+    def clock(self, now=None):
+        if self.mode == "demo" and self.quotes:
+            return max(row["ts"] for row in self.quotes.values())
+        return time.time() if now is None else now
+
+    def plan_reason(self, plan, now=None):
+        if plan.get("status") != "active":
+            return plan.get("reason", "提醒已取消")
+        if self.mode != "demo" and self.state != "running":
+            return "监控未正常运行，暂停执行"
+        return invalid_reason(plan, self.clock(now), self.quotes.get(plan["code"]), self.config)
+
+    def active_count(self, now=None):
+        return sum(not self.plan_reason(plan, now) for plan in self.plans.values())
+
     def rows(self, selection="全部候选", search="", now=None):
         now = now or time.time()
         result = []
-        priority = {"入场候选": 0, "突破确认": 1, "承接观察": 2, "回落观察": 3, "快速拉升": 4}
+        priority = {"买入提醒": 0, "结构确认": 1, "突破确认": 2, "承接观察": 3, "回落观察": 4, "快速拉升": 5}
         for row in self.quotes.values():
             code = row["code"]
             if search and search.casefold() not in (row["name"]+code).casefold():
@@ -125,6 +159,7 @@ class Dashboard:
         self.config, self.model = config, DashboardModel(config)
         self.messages, self.stop = queue.Queue(), threading.Event()
         self.worker, self.selected, self.popups = None, None, {}
+        self.selected_event = None
         self.key = tk.StringVar(value=os.environ.get("FUYAO_API_KEY", ""))
         self.context_enabled = tk.BooleanVar(value=config["context_enabled"])
         self.filter = tk.StringVar(value="全部候选")
@@ -132,10 +167,11 @@ class Dashboard:
         self.banner = tk.StringVar(value=STATES["idle"])
         self.status = tk.StringVar(value=self.model.status)
         self.market = tk.StringVar(value="市场背景：等待采样")
-        self.cards = {k: tk.StringVar(value="—") for k in ("更新", "股票池", "观察池", "候选", "请求")}
+        self.cards = {k: tk.StringVar(value="—") for k in ("更新", "股票池", "观察池", "有效买入", "累计提醒", "请求")}
         self.detail_title = tk.StringVar(value="选择一只股票")
         self.detail_metrics = tk.StringVar(value="行情开始采集后显示分时走势")
         self.detail_reason = tk.StringVar()
+        self.execution_text = tk.StringVar(value="尚无买入提醒")
         self.dirty = True
         window.title("A股短线雷达")
         window.geometry("1380x880")
@@ -202,7 +238,7 @@ class Dashboard:
         controls = ttk.Frame(left)
         controls.pack(fill="x", pady=(0, 8))
         combo = ttk.Combobox(controls, state="readonly", textvariable=self.filter, width=13,
-                             values=("全部候选", "入场候选", "突破确认", "承接观察", "回落观察", "快速拉升", "持仓"))
+                             values=("全部候选", "买入提醒", "结构确认", "突破确认", "承接观察", "回落观察", "快速拉升", "持仓"))
         combo.pack(side="left")
         combo.bind("<<ComboboxSelected>>", lambda _: self.mark_dirty())
         ttk.Entry(controls, textvariable=self.search, width=20).pack(side="left", padx=8)
@@ -223,7 +259,7 @@ class Dashboard:
         self.table.pack(side="left", fill="both", expand=True)
         scroll = ttk.Scrollbar(radar, command=self.table.yview)
         scroll.pack(side="right", fill="y"); self.table.configure(yscrollcommand=scroll.set)
-        for name, color in (("入场候选", RED), ("承接观察", AMBER), ("持仓", BLUE), ("已失效", MUTED), ("待更新", MUTED), ("已过期", MUTED)):
+        for name, color in (("买入提醒", RED), ("结构确认", AMBER), ("承接观察", AMBER), ("持仓", BLUE), ("已失效", MUTED), ("待更新", MUTED), ("已过期", MUTED)):
             self.table.tag_configure(name, foreground=color)
         self.table.bind("<<TreeviewSelect>>", self.select)
         self.alerts = ttk.Treeview(alerts, columns=("time", "kind", "name", "price"), show="headings")
@@ -234,7 +270,8 @@ class Dashboard:
         self.alerts.bind("<<TreeviewSelect>>", self.select_alert)
         ttk.Label(right, textvariable=self.detail_title, font=(self.font, 17, "bold"), padding=(15, 4)).pack(anchor="w")
         ttk.Label(right, textvariable=self.detail_metrics, wraplength=470, padding=(15, 4)).pack(anchor="w")
-        self.chart = tk.Canvas(right, bg=PANEL, highlightthickness=0, height=300)
+        ttk.Label(right, textvariable=self.execution_text, foreground=AMBER, wraplength=470, padding=(15, 5)).pack(fill="x")
+        self.chart = tk.Canvas(right, bg=PANEL, highlightthickness=0, height=200)
         self.chart.pack(fill="both", expand=True, padx=(12, 0), pady=10)
         self.chart.bind("<Configure>", lambda _: self.draw_chart())
         ttk.Label(right, text="触发依据与关键价位", foreground=MUTED, padding=(15, 5)).pack(anchor="w")
@@ -260,6 +297,7 @@ class Dashboard:
             except queue.Empty: break
         self.model.clear(mode)
         self.selected = None
+        self.selected_event = None
         for code in list(self.popups):
             self.dismiss(code)
         self.stop = threading.Event()
@@ -295,25 +333,30 @@ class Dashboard:
     def notify(self, event):
         code = event["code"]
         self.dismiss(code)
+        if event["kind"] in ("入场候选", "执行暂缓"):
+            return
         self.sound()
-        if event["kind"] == "失效":
+        if event["kind"] in ("失效", "买入取消", "持仓已记录"):
             return
         popup = self.tk.Toplevel(self.window)
         popup.title(event["kind"]+" · "+event["name"])
         popup.configure(bg=PANEL)
         popup.attributes("-topmost", True)
-        text = self.service.show_event(event)
-        self.tk.Label(popup, text=text, bg=PANEL, fg=TEXT, font=(self.font, 11),
+        text = self.tk.StringVar(value=self.service.show_event(event, now=self.model.clock()))
+        self.tk.Label(popup, textvariable=text, bg=PANEL, fg=TEXT, font=(self.font, 11),
                       wraplength=520, justify="left", padx=20, pady=20).pack()
         dismiss = lambda: self.dismiss(code)
         self.ttk.Button(popup, text="知道了", command=dismiss).pack(pady=(0, 12))
         popup.protocol("WM_DELETE_WINDOW", dismiss)
-        self.popups[code] = (popup, popup.after(15000, dismiss))
+        plan = event.get("metrics", {}).get("execution")
+        ttl = max(1, int((plan["expires_at"]-self.model.clock())*1000)) if event["kind"] == "买入提醒" and plan else 15000
+        self.popups[code] = (popup, popup.after(ttl, dismiss), text, event)
 
     def select(self, _=None):
         selected = self.table.selection()
         if selected:
             self.selected = selected[0]
+            self.selected_event = None
             self.render_detail()
 
     def select_alert(self, _=None):
@@ -321,7 +364,8 @@ class Dashboard:
         if selected:
             index = int(selected[0])
             if index < len(self.model.events):
-                self.selected = self.model.events[index]["code"]
+                self.selected_event = self.model.events[index]
+                self.selected = self.selected_event["code"]
                 self.render_detail()
 
     def render_detail(self):
@@ -330,6 +374,7 @@ class Dashboard:
             self.detail_title.set("选择一只股票")
             self.detail_metrics.set("启动后开始采集走势")
             self.detail_reason.set("")
+            self.execution_text.set("尚无买入提醒")
             self.draw_chart()
             return
         gain = (row["price"]/row["prev"]-1)*100
@@ -337,10 +382,26 @@ class Dashboard:
         self.detail_metrics.set(f"¥{row['price']:.2f}   {gain:+.2f}%   距参考涨停 {number(row.get('distance'))}%\n"
                                 f"成交均价 {number(row.get('vwap'))}  回落 {number(row.get('pullback'))}%\n"
                                 f"接收 {market_time(row['ts']):%H:%M:%S} · 行情时间为批次口径")
-        event = self.model.latest.get(row["code"])
+        event = self.selected_event or self.model.latest.get(row["code"])
+        plan = event.get("metrics", {}).get("execution") if self.selected_event else self.model.plans.get(row["code"])
+        current_plan = self.model.plans.get(row["code"])
+        if plan and current_plan and plan["id"] == current_plan["id"]:
+            plan = current_plan
+        if plan:
+            why = self.model.plan_reason(plan)
+            remaining = max(0, math.ceil(plan["expires_at"]-self.model.clock()))
+            state = ("执行暂缓" if plan["status"] == "blocked" else "持仓已记录" if plan["status"] == "recorded" else "已取消")+"："+why if why else f"买入提醒 · 剩余最多{remaining}秒"
+            text = (f"{state}\n参考 {plan['reference_price']:.2f} · 最高委托 {plan['max_price']:.2f}"
+                    f"\n跌回 {plan['cancel_price']:.2f} 取消 · 有效至 {market_time(plan['expires_at']):%H:%M:%S}")
+            if not why:
+                text += f"\n参考{plan['quantity']}股 · 金额≤{plan['max_notional']:.2f}元（按本地记录估算）"
+            self.execution_text.set(text)
+        else:
+            self.execution_text.set("结构确认后，还需满足执行条件才会发出买入提醒")
         reason = f"当前阶段：{self.model.stage(row, time.time())}"
         if event:
-            reason += f"\n{market_time(event['ts']):%H:%M:%S} {event['kind']}：{event['reason']}"
+            label = "结构确认" if event["kind"] == "入场候选" else event["kind"]
+            reason += f"\n{market_time(event['ts']):%H:%M:%S} {label}：{event['reason']}"
             if event.get("low"):
                 reason += f"\n承接低点参考 {event['low']:.2f}"
             evidence = event.get("metrics", {})
@@ -410,7 +471,8 @@ class Dashboard:
         self.cards["更新"].set(f"{market_time(received):%H:%M:%S}" if received else "—")
         self.cards["股票池"].set(str(stats.get("universe", "—")))
         self.cards["观察池"].set(str(stats.get("watch", "—")))
-        self.cards["候选"].set(str(self.model.counts["入场候选"]))
+        self.cards["有效买入"].set(str(self.model.active_count()))
+        self.cards["累计提醒"].set(str(self.model.counts["买入提醒"]))
         self.cards["请求"].set(number(stats.get("elapsed"), 2, "秒"))
         self.status.set(self.model.status)
         context = self.model.context if self.config["context_enabled"] else {"enabled": False}
@@ -446,7 +508,16 @@ class Dashboard:
                 self.table.insert("", i, iid=code, values=values, tags=(stage,))
         self.alerts.delete(*self.alerts.get_children())
         for i, event in enumerate(self.model.events):
-            self.alerts.insert("", "end", iid=str(i), values=(f"{market_time(event['ts']):%H:%M:%S}", event["kind"], event["name"], number(event["price"])))
+            label = "结构确认" if event["kind"] == "入场候选" else event["kind"]
+            self.alerts.insert("", "end", iid=str(i), values=(f"{market_time(event['ts']):%H:%M:%S}", label, event["name"], number(event["price"])))
+        for code, entry in list(self.popups.items()):
+            event = entry[3]
+            if event["kind"] == "买入提醒":
+                plan = self.model.plans.get(code, event["metrics"]["execution"])
+                if self.model.plan_reason(plan):
+                    self.dismiss(code)
+                else:
+                    entry[2].set(self.service.show_event(event, now=self.model.clock()))
         if not self.selected and rows:
             self.selected = rows[0][0]["code"]
             self.table.selection_set(self.selected)
@@ -460,11 +531,11 @@ class Dashboard:
                 kind, value = self.messages.get_nowait()
                 if kind == "event":
                     value = dict(value)
-                    if self.model.mode != "demo" and value["kind"] == "入场候选" and (self.stop.is_set() or time.time()-value["ts"] > self.config["signal_expiry_seconds"]):
-                        value.update(kind="失效", reason="监控已停止或提醒到达时已过期")
-                    if not self.stop.is_set():
-                        self.notify(value)
                 self.model.ingest(kind, value)
+                if kind == "event" and not self.stop.is_set():
+                    plan = value.get("metrics", {}).get("execution")
+                    if value["kind"] != "买入提醒" or (plan and not self.model.plan_reason(plan)):
+                        self.notify(value)
                 self.mark_dirty()
                 processed += 1
         except queue.Empty:
@@ -507,7 +578,9 @@ class Dashboard:
 
     def help(self):
         from tkinter import messagebox
-        messagebox.showinfo("使用说明", "颜色：红色为入场候选，黄色为承接观察，蓝色为实际持仓。\n"
+        messagebox.showinfo("使用说明", "颜色：红色为有效买入提醒，黄色为结构/承接观察，蓝色为实际持仓。\n"
+                            "结构确认后检查执行条件；买入提醒显示固定上限、取消价、最多20秒有效期。\n"
+                            "有效买入与累计提醒分别统计，过期记录不是当前买点。\n"
                             "近60秒涨速只使用已采集样本；量能倍数为当前成交速率相对回落期速率。\n"
                             "走势图只展示程序已采集的数据，参考涨停价不是权威交易价格。\n"
                             "先演示再启动实时监控；笔记本须保持联网、不休眠。\n"

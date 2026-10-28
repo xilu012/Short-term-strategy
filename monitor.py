@@ -18,12 +18,13 @@ import urllib.request
 
 from strategy import CN, Engine, Tick, holding_event, limit_price, main_board, market_time
 from market_context import MarketContext
+from execution import Execution
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
 BASE = "https://fuyao.aicubes.cn"
 POSITIONS_LOCK = threading.Lock()
-VERSION = "0.2.1"
+VERSION = "0.3"
 
 
 def configuration(path=None):
@@ -40,13 +41,15 @@ def configuration(path=None):
             continue
         if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0:
             raise ValueError("配置必须是有限正数: " + k)
-    for k in ("batch_size", "max_watch", "min_rise_samples", "min_stable_updates", "rebound_confirm_updates", "max_failed_breakouts"):
+    for k in ("batch_size", "max_watch", "min_rise_samples", "min_stable_updates", "rebound_confirm_updates", "max_failed_breakouts", "entry_max_positions"):
         if not isinstance(c[k], int):
             raise ValueError(k + " 必须为整数")
     if c["batch_size"] > 100 or c["max_watch"] > 100:
         raise ValueError("试验版每批/重点观察最多100只")
     if c["pullback_min_pct"] >= c["pullback_max_pct"] or c["min_rise_retention_ratio"] > 1:
         raise ValueError("阈值上下界错误")
+    if c["entry_position_fraction"] > 1:
+        raise ValueError("entry_position_fraction 不得超过1")
     return c
 
 
@@ -203,6 +206,7 @@ class Monitor:
         self.key, self.mode, self.max_cycles = key, mode, max_cycles
         self.codes = codes
         self.engine = Engine(config)
+        self.execution = Execution(config)
         self.positions = Positions()
         self.market_context = MarketContext(config, DATA)
         self.store = None
@@ -221,7 +225,7 @@ class Monitor:
         except OSError:
             pass
 
-    def quote_view(self, t, position=None):
+    def quote_view(self, t, position=None, request_elapsed=0):
         s = self.engine.states.get(t.code)
         history = list(s.history) if s else []
         first = next((x for x in history if t.ts-x.ts <= 60), t)
@@ -234,6 +238,7 @@ class Monitor:
                     vwap=t.turnover/t.volume if t.volume else None,
                     distance=(limit_price(t.prev)/t.price-1)*100,
                     low=s.low if s else None, confirming=bool(s and s.confirm_updates),
+                    request_elapsed=request_elapsed, execution=self.execution.latest.get(t.code),
                     position=dict(position) if position else None,
                     context=self.market_context.stock_view(t.code, t.ts, t.gain))
 
@@ -243,17 +248,47 @@ class Monitor:
         self.store.event(event)
         self.emit("event", asdict(event))
 
-    def consume(self, data, received, names, held):
+    def advance_execution(self, now, positions=None, reason=None):
+        for event in self.execution.advance(now, positions, reason):
+            self.send_event(event)
+
+    def process_tick(self, t, elapsed, positions, held=()):
+        for event in self.execution.observe(t, elapsed, positions):
+            self.send_event(event)
+        if t.code not in positions and t.code not in held:
+            for event in self.engine.feed(t):
+                self.send_event(event)
+                if event.kind == "入场候选":
+                    reminder = self.execution.offer(event, t, elapsed, positions)
+                    if reminder:
+                        self.send_event(reminder)
+        if t.code in positions:
+            event = holding_event(positions[t.code], t, self.c)
+            if event:
+                self.send_event(event)
+
+    def consume(self, data, received, names, held, elapsed=0, record_kind=None):
+        self.advance_execution(received)
         stamp = data.get("timestamp")
         if not isinstance(stamp, (int, float)) or not math.isfinite(stamp):
+            if record_kind:
+                self.store.frame(record_kind, data, received, elapsed)
             self.emit("status", "批次缺少有效行情时间，已存档但不生成信号")
+            self.advance_execution(received, reason="行情时间未知，取消买入提醒")
             return False
         age = received-stamp/1000
         if age > self.c["max_batch_age_seconds"] or age < -5:
+            if record_kind:
+                self.store.frame(record_kind, data, received, elapsed)
             self.emit("status", f"批次行情时间异常/过旧（{age:.1f}秒），不生成信号")
+            self.advance_execution(received, reason="批次行情过旧或时间异常，取消买入提醒")
             return False
         with self.positions.lock:
             positions = self.positions.read()
+            data.setdefault("_context", {})["positions"] = positions
+            data["_context"]["held"] = sorted(set(held)|set(positions))
+            if record_kind:
+                self.store.frame(record_kind, data, received, elapsed)
             views = []
             for row in data["item"]:
                 code = row.get("thscode")
@@ -264,14 +299,8 @@ class Monitor:
                 except (KeyError, TypeError, ValueError, OverflowError):
                     self.emit("status", f"跳过无效行情: {code}")
                     continue
-                if code not in held:
-                    for e in self.engine.feed(t):
-                        self.send_event(e)
-                if code in positions:
-                    e = holding_event(positions[code], t, self.c)
-                    if e:
-                        self.send_event(e)
-                views.append(self.quote_view(t, positions.get(code)))
+                self.process_tick(t, elapsed, positions, held)
+                views.append(self.quote_view(t, positions.get(code), elapsed))
             if positions:
                 self.positions.write(positions)
         if views:
@@ -290,8 +319,7 @@ class Monitor:
                         break
                     self.store.frame("demo", {"timestamp": t.batch_ms, "item": [asdict(t)]}, t.ts, 0)
                     self.emit("status", f"演示 {market_time(t.ts):%H:%M:%S} 价格 {t.price:.2f}，使用合成数据")
-                    for e in self.engine.feed(t):
-                        self.send_event(e)
+                    self.process_tick(t, 0, {})
                     self.emit("quotes", [self.quote_view(t)])
                     self.emit("lifecycle", "demo")
                     self.stop.wait(0.35)
@@ -322,16 +350,20 @@ class Monitor:
             self.emit("status", f"股票池 {len(names)} 只；重点观察最多 {self.c['max_watch']} 只；尚未验证交易效果")
             self.loop(client, names)
         except ApiError as e:
+            self.advance_execution(time.time(), reason="监控异常，取消买入提醒")
             self.emit("lifecycle", "error")
             self.connection_issue(str(e))
             self.emit("error", f"{self.request_scope}：{e}")
         except Exception as e:
+            self.advance_execution(time.time(), reason="本地处理异常，取消买入提醒")
             self.emit("lifecycle", "error")
             # Deliberately no exception text/traceback containing headers or secrets.
             message = f"本地处理失败（{type(e).__name__}），请检查配置、持仓文件及磁盘权限"
             self.connection_issue(message)
             self.emit("error", message)
         finally:
+            if self.store:
+                self.advance_execution(time.time(), reason="监控停止，取消买入提醒")
             self.key = ""
             if self.store:
                 self.store.close()
@@ -345,6 +377,7 @@ class Monitor:
         backoff, cycles = 2, 0
         scan_started = time.monotonic()
         while not self.stop.is_set():
+            self.advance_execution(time.time())
             now = datetime.now(CN)
             if str(now.date()) != day:
                 if day is not None:
@@ -356,6 +389,7 @@ class Monitor:
             if self.c["context_enabled"] and calendar is not None and now.date() not in calendar:
                 phase = "closed"
             if phase == "closed":
+                self.advance_execution(time.time(), reason="当前休市，取消买入提醒")
                 self.emit("lifecycle", "paused")
                 self.emit("status", "当前休市，保持运行将于下一交易时段继续；午休后重新观察盘中结构。")
                 self.stop.wait(30)
@@ -363,7 +397,9 @@ class Monitor:
             try:
                 self.request_scope = "本地持仓"
                 with self.positions.lock:
-                    held = set(self.positions.read())
+                    positions = self.positions.read()
+                    held = set(positions)
+                self.advance_execution(time.time(), positions)
                 if held-set(names):
                     raise ApiError("持仓含当前股票池以外代码；请清理或另行人工监控，程序不静默忽略")
                 mono = time.monotonic()
@@ -392,7 +428,8 @@ class Monitor:
                 # Holdings take priority; candidate list is refreshed by rolling market scans.
                 candidates = {k: v for k, v in candidates.items() if time.time()-v[1] < 300}
                 ranked = sorted(candidates, key=lambda k: candidates[k][0], reverse=True)
-                watch = sorted(held) + [k for k in ranked if k not in held][:max(0, self.c["max_watch"]-len(held))]
+                priority = sorted(held)+[k for k in self.execution.active if k not in held]
+                watch = priority+[k for k in ranked if k not in priority][:max(0, self.c["max_watch"]-len(priority))]
                 if len(held) > self.c["max_watch"]:
                     raise ApiError("持仓数量超过重点观察上限")
                 is_watch = bool(watch) and mono >= next_watch
@@ -426,8 +463,8 @@ class Monitor:
                 data, elapsed = client.get("/api/a-share/prices/snapshot", thscodes=",".join(batch))
                 received = time.time()
                 data["_context"] = {"held": sorted(held), "names": {k: names[k]["name"] for k in batch}}
-                self.store.frame("watch" if is_watch else "scan", data, received, elapsed)
                 if self.stop.is_set():
+                    self.store.frame("watch" if is_watch else "scan", data, received, elapsed)
                     return
                 for row in data["item"]:
                     code = row.get("thscode")
@@ -444,7 +481,7 @@ class Monitor:
                             candidates.pop(code, None)
                     except (ValueError, TypeError, KeyError, ZeroDivisionError):
                         continue
-                valid = self.consume(data, received, names, held)
+                valid = self.consume(data, received, names, held, elapsed, "watch" if is_watch else "scan")
                 self.stats.update(watch=len(watch), requests=self.stats["requests"]+1,
                                   received=received, elapsed=elapsed, batch_ms=data.get("timestamp"))
                 self.emit("stats", dict(self.stats))
@@ -459,6 +496,7 @@ class Monitor:
                     return
                 self.stop.wait(0.5)  # Serial requests; never burst retries.
             except ApiError as e:
+                self.advance_execution(time.time(), reason="连接重试或限流，取消买入提醒")
                 if not e.retry:
                     raise
                 self.emit("lifecycle", "retrying")
@@ -468,12 +506,25 @@ class Monitor:
                 backoff = min(backoff*2, 120)
 
 
-def show_event(e):
+def show_event(e, now=None):
     clock = market_time(e["ts"]).strftime("%H:%M:%S")
     batch = market_time(e["batch_ms"]/1000).strftime("%H:%M:%S") if e["batch_ms"] else "未知"
-    return (f"[{e['kind']}] {e['name']} {e['code']}  ¥{e['price']:.2f}\n"
-            f"信号接收时间 {clock}｜批次最新行情 {batch}\n{e['reason']}" +
-            (f"\n承接低点参考 ¥{e['low']:.2f}" if e["low"] else ""))
+    label = "结构确认" if e["kind"] == "入场候选" else e["kind"]
+    text = (f"[{label}] {e['name']} {e['code']}  记录价 ¥{e['price']:.2f}\n"
+            f"接收时间 {clock}｜批次最新行情 {batch}\n{e['reason']}")
+    plan = e.get("metrics", {}).get("execution")
+    if plan and e["kind"] in ("买入提醒", "买入取消"):
+        text += (f"\n参考价 ¥{plan['reference_price']:.2f} · 最高委托价 ¥{plan['max_price']:.2f}"
+                 f"\n跌回 ¥{plan['cancel_price']:.2f} 取消 · 有效至 {market_time(plan['expires_at']):%H:%M:%S}")
+        if e["kind"] == "买入提醒":
+            left = max(0, math.ceil(plan["expires_at"]-(e["ts"] if now is None else now)))
+            text += f"\n剩余最多 {left}秒 · 参考 {plan['quantity']}股 / 金额≤¥{plan['max_notional']:.2f}"
+            text += "\n股数按本地资金记录估算；实际资金、盘口和成交以券商为准"
+        else:
+            text += "\n仅取消本次提醒；未成交委托请手动撤销，已成交部分按持仓管理"
+    elif e.get("low"):
+        text += f"\n承接低点参考 ¥{e['low']:.2f}"
+    return text
 
 
 def gui(config):
@@ -483,25 +534,40 @@ def gui(config):
 
 
 def replay(path, config):
-    # Read-only replay of raw quotes; no fills, profits or success-rate claims.
+    # Quote replay with current execution rules; no order/fill or profit simulation.
     db = sqlite3.connect(Path(path).resolve().as_uri()+"?mode=ro", uri=True)
-    engine, counts = Engine(config), {}
+    engine, execution, counts = Engine(config), Execution(config), {}
+    def output(events):
+        for event in events:
+            counts[event.kind] = counts.get(event.kind, 0)+1
+            print(show_event(asdict(event)), "\n")
     try:
-        for received, batch_ms, payload in db.execute("SELECT received,batch_ms,payload FROM frames WHERE kind IN ('scan','watch') ORDER BY received,id"):
+        rows = db.execute("SELECT received,batch_ms,elapsed,payload FROM frames WHERE kind IN ('scan','watch') ORDER BY received,id")
+        for received, batch_ms, elapsed, payload in rows:
+            output(execution.advance(received))
             if not batch_ms or not -5 <= received-batch_ms/1000 <= config["max_batch_age_seconds"]:
+                output(execution.advance(received, reason="批次行情过旧或时间异常"))
                 continue
             data = json.loads(payload)
             context = data.get("_context", {})
+            held = set(context.get("held", []))
+            positions = context.get("positions", {} if not held else None)
+            if positions is not None:
+                output(execution.advance(received, positions))
             for row in data["item"]:
-                if row.get("thscode") in context.get("held", []):
-                    continue
                 try:
                     t = Tick.parse(row, received, batch_ms, context.get("names", {}).get(row["thscode"], row["thscode"]))
                 except (KeyError, ValueError, TypeError):
                     continue
-                for e in engine.feed(t):
-                    counts[e.kind] = counts.get(e.kind, 0)+1
-                    print(show_event(asdict(e)), "\n")
+                output(execution.observe(t, elapsed, positions))
+                if t.code in held:
+                    continue
+                for event in engine.feed(t):
+                    output([event])
+                    if event.kind == "入场候选":
+                        reminder = execution.offer(event, t, elapsed, positions)
+                        if reminder:
+                            output([reminder])
     finally:
         db.close()
     print("信号回放数量（不是交易回测）：", json.dumps(counts, ensure_ascii=False))

@@ -116,7 +116,8 @@ class Engine:
             metrics = dict(gain=t.gain, distance_pct=(limit_price(t.prev)/t.price-1)*100,
                            vwap=vwap, vwap_deviation_pct=(t.price/vwap-1)*100 if vwap else None,
                            volume_ratio=s.last_ratio, confirmed_updates=s.confirm_updates,
-                           stable_updates=s.stable_updates, failed_breakouts=s.failed_breakouts)
+                           stable_updates=s.stable_updates, failed_breakouts=s.failed_breakouts,
+                           breakout_level=s.confirm_level)
             events.append(Event(kind, t.code, t.name, t.ts, t.price, reason, s.low, t.batch_ms, metrics))
         if s.history:
             last = s.history[-1]

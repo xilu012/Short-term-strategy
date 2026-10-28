@@ -8,6 +8,8 @@ from unittest.mock import patch
 
 import monitor
 from dashboard import Dashboard, DashboardModel
+from execution import Execution
+from strategy import Engine
 
 
 class ModelTests(unittest.TestCase):
@@ -36,7 +38,7 @@ class ModelTests(unittest.TestCase):
 
     def test_filter_and_error_state(self):
         self.model.ingest("quotes", [self.row()])
-        self.assertEqual(len(self.model.rows("入场候选")), 1)
+        self.assertEqual(len(self.model.rows("结构确认")), 1)
         self.assertFalse(self.model.rows(search="不存在"))
         self.model.ingest("error", "权限不足")
         self.model.ingest("done", "已停止")
@@ -60,6 +62,39 @@ class ModelTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("DISPLAY"), "需要桌面显示")
 class DesktopTests(unittest.TestCase):
+    def test_buy_popup_shows_frozen_prices_and_expires_without_new_backend_event(self):
+        import tkinter as tk
+        with tempfile.TemporaryDirectory() as directory, patch.object(monitor, "DATA", Path(directory)):
+            root = tk.Tk()
+            app = Dashboard(root, monitor.configuration(), monitor)
+            try:
+                config = monitor.configuration()
+                engine, execution = Engine(config), Execution(config)
+                reminder = None
+                for t in list(monitor.demo_ticks())[:15]:
+                    for event in engine.feed(t):
+                        if event.kind == "入场候选":
+                            reminder = execution.offer(event, t, 0, {})
+                value = asdict(reminder)
+                app.model.clear("demo")
+                app.model.ingest("event", value)
+                app.model.ingest("lifecycle", "demo")
+                app.notify(value)
+                app.refresh(); root.update()
+                self.assertEqual(app.cards["有效买入"].get(), "1")
+                self.assertIn("最高委托价 ¥10.61", app.popups[reminder.code][2].get())
+                self.assertIn("最高委托 10.61", app.execution_text.get())
+                quote = dict(value["metrics"]["execution_quote"], phase="signaled", position=None)
+                quote.update(ts=quote["ts"]+21, batch_ms=quote["batch_ms"]+21000)
+                app.model.ingest("quotes", [quote])
+                app.refresh(); root.update()
+                self.assertFalse(app.popups)
+                self.assertEqual(app.cards["有效买入"].get(), "0")
+                self.assertEqual(app.cards["累计提醒"].get(), "1")
+                self.assertIn("已取消", app.execution_text.get())
+            finally:
+                app.close()
+
     def test_footer_and_error_details_remain_visible_in_small_window(self):
         import tkinter as tk
         with tempfile.TemporaryDirectory() as directory, patch.object(monitor, "DATA", Path(directory)):
@@ -101,7 +136,10 @@ class DesktopTests(unittest.TestCase):
                 self.assertEqual(app.model.counts["入场候选"], 1)
                 self.assertEqual(len(app.table.get_children()), 1)
                 self.assertGreater(len(app.chart.find_all()), 10)
-                self.assertEqual(len(app.alerts.get_children()), 3)
+                self.assertEqual(app.model.counts["买入提醒"], 1)
+                self.assertEqual(app.cards["累计提醒"].get(), "1")
+                self.assertEqual(app.cards["有效买入"].get(), "0")
+                self.assertEqual(len(app.alerts.get_children()), 5)
                 self.assertFalse(errors)
                 app.model.clear("live")
                 app.refresh()
