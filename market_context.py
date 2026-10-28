@@ -1,5 +1,4 @@
 """Optional, timestamped market evidence. Never used as an entry gate."""
-from collections import defaultdict
 from datetime import datetime
 import json
 import math
@@ -20,6 +19,7 @@ class MarketContext:
         self.previous, self.previous_complete, self.previous_page = {}, False, 1
         self.sectors, self.members, self.indices = {}, {}, {}
         self.market, self.errors = None, {}
+        self.failures = {}
         self.index_cursor = 0
         self.cache = directory / f"industry-members-{self.today}.json"
         if self.cache.exists():
@@ -63,16 +63,26 @@ class MarketContext:
             "members": ("/api/a-share-index/constituents/ths-stock-list", dict(thscode=sector if task == "members" else "")),
         }[task]
         try:
-            data, elapsed = client.get(path, **params)
+            data, elapsed = client.get(path, request_timeout=3, **params)
         except Exception as e:
-            if getattr(e, "retry", False) or getattr(e, "code", None) == 2001:
-                raise  # Shared network backoff and fatal invalid-key handling.
+            if getattr(e, "code", None) == 2001:
+                raise
+            if getattr(e, "code", None) in (429, 4001):
+                # Stop all optional requests during the shared rate-limit cooldown.
+                self.next_request = mono+max(60, self.c["context_interval_seconds"])
+                self.errors[task] = "附加信息限流，已暂停附加请求并对全局退避"
+                raise
             self.errors[task] = str(e) if hasattr(e, "retry") else "附加数据暂不可用"
-            self.next[task] = math.inf  # Retry on restart, no repeated rights failures.
+            if getattr(e, "retry", False):
+                self.failures[task] = self.failures.get(task, 0)+1
+                self.next[task] = mono+min(600, self.c["context_interval_seconds"]*2**min(self.failures[task]-1, 3))
+            else:
+                self.next[task] = math.inf
             return {"task": task, "error": self.errors[task]}
         try:
             self.accept(task, data, now, mono, sector if task == "members" else None)
             self.errors.pop(task, None)
+            self.failures.pop(task, None)
         except (ValueError, KeyError, TypeError, OverflowError):
             self.errors[task] = "附加数据字段或日期不完整，未用于判断"
             self.next[task] = math.inf

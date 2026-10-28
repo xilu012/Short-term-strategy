@@ -8,6 +8,7 @@ import math
 import os
 from pathlib import Path
 import queue
+import re
 import sqlite3
 import threading
 import time
@@ -22,7 +23,7 @@ ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
 BASE = "https://fuyao.aicubes.cn"
 POSITIONS_LOCK = threading.Lock()
-VERSION = "0.2"
+VERSION = "0.2.1"
 
 
 def configuration(path=None):
@@ -69,7 +70,7 @@ class Client:
         self.key = key
         self.opener = urllib.request.build_opener(NoRedirect())
 
-    def get(self, path, **params):
+    def get(self, path, request_timeout=8, **params):
         if path not in ("/api/meta/tickers/list", "/api/a-share/prices/snapshot", "/api/a-share/auction/snapshot",
                         "/api/a-share/calendar/trading-days", "/api/a-share/special-data/limit-up-pool",
                         "/api/a-share/special-data/limit-up-statistics", "/api/a-share-index/prices/snapshot",
@@ -79,10 +80,10 @@ class Client:
         req = urllib.request.Request(url, headers={"X-api-key": self.key, "User-Agent": "AShareResearchMonitor/0.1"})
         started = time.monotonic()
         try:
-            with self.opener.open(req, timeout=8) as r:
+            with self.opener.open(req, timeout=request_timeout) as r:
                 payload = json.loads(r.read(16*1024*1024))
         except urllib.error.HTTPError as e:
-            raise ApiError("HTTP " + str(e.code), retry=e.code == 429 or e.code >= 500) from None
+            raise ApiError("HTTP " + str(e.code), retry=e.code == 429 or e.code >= 500, code=e.code) from None
         except (urllib.error.URLError, TimeoutError, OSError):
             raise ApiError("网络连接失败或超时", retry=True) from None
         except (ValueError, UnicodeError):
@@ -206,6 +207,19 @@ class Monitor:
         self.market_context = MarketContext(config, DATA)
         self.store = None
         self.stats = {"universe": 0, "watch": 0, "requests": 0}
+        self.request_scope = "初始化"
+
+    def connection_issue(self, message, wait=0, blocking=True):
+        message = str(message).replace(self.key, "[已隐藏]") if self.key else str(message)
+        message = re.sub(r"sk-fuyao-[A-Za-z0-9_-]+", "[已隐藏]", message)
+        issue = dict(time=datetime.now(CN).isoformat(timespec="seconds"), stage=self.request_scope,
+                     message=message, wait=wait, blocking=blocking, version=VERSION)
+        self.emit("connection", issue)
+        try:
+            with (DATA / "connection.jsonl").open("a", encoding="utf-8") as file:
+                file.write(json.dumps(issue, ensure_ascii=False)+"\n")
+        except OSError:
+            pass
 
     def quote_view(self, t, position=None):
         s = self.engine.states.get(t.code)
@@ -267,6 +281,7 @@ class Monitor:
     def run(self):
         try:
             self.emit("lifecycle", "loading")
+            self.emit("status", "正在准备本地行情存储并读取股票代码表")
             self.store = Storage(self.mode)
             self.store.session(self.mode, self.c)
             if self.mode == "demo":
@@ -282,6 +297,7 @@ class Monitor:
                     self.stop.wait(0.35)
                 return
             client = Client(self.key)
+            self.request_scope = "股票代码表"
             startup_backoff = 2
             while not self.stop.is_set():
                 try:
@@ -291,7 +307,8 @@ class Monitor:
                     if not e.retry:
                         raise
                     self.emit("lifecycle", "retrying")
-                    self.emit("status", f"代码表连接失败，{startup_backoff}秒后重试")
+                    self.connection_issue(str(e), startup_backoff)
+                    self.emit("status", f"代码表：{e}，{startup_backoff}秒后重试")
                     self.stop.wait(startup_backoff)
                     startup_backoff = min(startup_backoff*2, 120)
             if self.stop.is_set():
@@ -306,11 +323,14 @@ class Monitor:
             self.loop(client, names)
         except ApiError as e:
             self.emit("lifecycle", "error")
-            self.emit("error", str(e))
+            self.connection_issue(str(e))
+            self.emit("error", f"{self.request_scope}：{e}")
         except Exception as e:
             self.emit("lifecycle", "error")
             # Deliberately no exception text/traceback containing headers or secrets.
-            self.emit("error", f"本地处理失败（{type(e).__name__}），请检查配置、持仓文件及磁盘权限")
+            message = f"本地处理失败（{type(e).__name__}），请检查配置、持仓文件及磁盘权限"
+            self.connection_issue(message)
+            self.emit("error", message)
         finally:
             self.key = ""
             if self.store:
@@ -341,6 +361,7 @@ class Monitor:
                 self.stop.wait(30)
                 continue
             try:
+                self.request_scope = "本地持仓"
                 with self.positions.lock:
                     held = set(self.positions.read())
                 if held-set(names):
@@ -351,6 +372,7 @@ class Monitor:
                     if not batch:
                         self.stop.wait(5)
                         continue
+                    self.request_scope = "竞价行情"
                     data, elapsed = client.get("/api/a-share/auction/snapshot", thscodes=",".join(batch), stage="final")
                     received = time.time()
                     self.store.frame("auction", data, received, elapsed)
@@ -378,10 +400,14 @@ class Monitor:
                     batch = watch
                     next_watch = mono+self.c["watch_interval_seconds"]
                 elif self.market_context.due(mono):
+                    self.request_scope = "附加市场信息"
                     extra = self.market_context.step(client, time.time(), mono)
                     if extra and "data" in extra:
                         self.store.frame("context:"+extra["task"], extra["data"], time.time(), extra["elapsed"])
                         self.stats["requests"] += 1
+                    if extra and "error" in extra:
+                        self.request_scope = "附加信息/"+extra["task"]
+                        self.connection_issue(extra["error"], blocking=False)
                     self.emit("context", self.market_context.view())
                     self.stop.wait(0.5)
                     continue
@@ -396,6 +422,7 @@ class Monitor:
                 else:
                     self.stop.wait(0.2)
                     continue
+                self.request_scope = "重点股行情" if is_watch else "全池行情扫描"
                 data, elapsed = client.get("/api/a-share/prices/snapshot", thscodes=",".join(batch))
                 received = time.time()
                 data["_context"] = {"held": sorted(held), "names": {k: names[k]["name"] for k in batch}}
@@ -435,7 +462,8 @@ class Monitor:
                 if not e.retry:
                     raise
                 self.emit("lifecycle", "retrying")
-                self.emit("status", f"{e}；退避{backoff}秒；采样中断时旧结构会重置")
+                self.connection_issue(str(e), backoff)
+                self.emit("status", f"{self.request_scope}：{e}；退避{backoff}秒；采样中断时旧结构会重置")
                 self.stop.wait(backoff)
                 backoff = min(backoff*2, 120)
 

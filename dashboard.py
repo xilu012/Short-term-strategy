@@ -35,6 +35,7 @@ class DashboardModel:
         self.counts = Counter()
         self.stats, self.context = {}, {}
         self.status = "点击启动监控；演示可从工具菜单运行。"
+        self.last_error, self.last_connection = "", {}
 
     def ingest(self, kind, value):
         if kind == "quotes":
@@ -59,10 +60,15 @@ class DashboardModel:
             self.context = value
         elif kind == "lifecycle":
             self.state = value
+        elif kind == "connection":
+            self.last_connection = value
         elif kind in ("status", "error", "done"):
+            if kind == "done" and self.state == "error":
+                return
             self.status = value
             if kind == "error":
                 self.state = "error"
+                self.last_error = value
             elif kind == "done" and self.state != "error":
                 self.state = "stopped"
 
@@ -157,7 +163,8 @@ class Dashboard:
         header = ttk.Frame(self.window, padding=(18, 12))
         header.pack(fill="x")
         ttk.Label(header, text="A股短线雷达", font=(self.font, 20, "bold")).pack(side="left")
-        ttk.Label(header, textvariable=self.banner, foreground=GREEN).pack(side="left", padx=25)
+        self.state_label = ttk.Label(header, textvariable=self.banner, foreground=MUTED)
+        self.state_label.pack(side="left", padx=25)
         self.start_button = ttk.Button(header, text="启动监控", command=lambda: self.start("live"))
         self.start_button.pack(side="right", padx=5)
         self.stop_button = ttk.Button(header, text="停止", command=self.request_stop, state="disabled")
@@ -184,6 +191,10 @@ class Dashboard:
             tk.Label(box, text=label, bg=PANEL, fg=MUTED, font=(self.font, 10)).pack(anchor="w")
             tk.Label(box, textvariable=value, bg=PANEL, fg=TEXT, font=(self.font, 16, "bold")).pack(anchor="w")
         ttk.Label(self.window, textvariable=self.market, foreground=MUTED, padding=(20, 4)).pack(fill="x")
+        # Reserve footer space before the expanding panes, including at Windows DPI scaling.
+        self.status_bar = ttk.Label(self.window, textvariable=self.status, foreground=MUTED,
+                                    wraplength=1000, padding=(18, 8))
+        self.status_bar.pack(side="bottom", fill="x")
         body = ttk.Panedwindow(self.window, orient="horizontal")
         body.pack(fill="both", expand=True, padx=18, pady=10)
         left, right = ttk.Frame(body), ttk.Frame(body)
@@ -228,7 +239,6 @@ class Dashboard:
         self.chart.bind("<Configure>", lambda _: self.draw_chart())
         ttk.Label(right, text="触发依据与关键价位", foreground=MUTED, padding=(15, 5)).pack(anchor="w")
         ttk.Label(right, textvariable=self.detail_reason, wraplength=470, padding=(15, 8)).pack(fill="x")
-        ttk.Label(self.window, textvariable=self.status, foreground=MUTED, wraplength=1300, padding=(18, 8)).pack(fill="x")
 
     def mark_dirty(self):
         self.dirty = True
@@ -256,6 +266,7 @@ class Dashboard:
         monitor = self.service.Monitor(self.config, lambda k, v: self.messages.put((k, v)), self.stop, self.key.get().strip(), mode)
         self.worker = threading.Thread(target=monitor.run, daemon=True)
         self.model.state = "loading"
+        self.model.status = "正在准备存储并连接数据源"
         self.worker.start()
         self.mark_dirty()
 
@@ -388,6 +399,9 @@ class Dashboard:
 
     def refresh(self):
         self.banner.set(STATES.get(self.model.state, self.model.state))
+        if self.model.state == "retrying" and self.model.last_connection:
+            self.banner.set(self.model.last_connection["stage"]+"重试")
+        self.state_label.configure(foreground=RED if self.model.state == "error" else AMBER if self.model.state in ("retrying", "stale", "paused") else GREEN if self.model.state in ("running", "demo") else MUTED)
         alive = bool(self.worker and self.worker.is_alive())
         self.start_button.configure(state="disabled" if alive else "normal")
         self.stop_button.configure(state="normal" if alive and not self.stop.is_set() else "disabled")
@@ -505,6 +519,13 @@ class Dashboard:
                       indices="指数行情", members="行业成分", cache="本地缓存")
         errors = self.model.context.get("errors", {})
         text = "主监控："+STATES.get(self.model.state, self.model.state)
+        if self.model.last_error:
+            text += "\n停止原因："+self.model.last_error
+        issue = self.model.last_connection
+        if issue:
+            text += f"\n最近异常 {issue['time']}\n{issue['stage']}：{issue['message']}"
+            if issue["wait"]:
+                text += f"\n当次退避 {issue['wait']}秒"
         text += "\n行业映射："+self.model.context.get("mapping", "等待数据")
         text += "\n\n"+("\n".join(labels.get(k,k)+"："+v for k,v in errors.items()) if errors else "尚未记录附加接口错误；未显示数值也可能是尚未请求或数据已过期。")
         messagebox.showinfo("数据连接状态", text)

@@ -41,6 +41,14 @@ class ModelTests(unittest.TestCase):
         self.model.ingest("error", "权限不足")
         self.model.ingest("done", "已停止")
         self.assertEqual(self.model.state, "error")
+        self.assertEqual(self.model.status, "权限不足")
+        self.assertEqual(self.model.last_error, "权限不足")
+
+    def test_latest_connection_reason_is_retained(self):
+        issue = dict(stage="重点股行情", message="HTTP 429", wait=4, time="10:00:00", blocking=True)
+        self.model.ingest("connection", issue)
+        self.model.ingest("status", "已恢复")
+        self.assertEqual(self.model.last_connection, issue)
 
     def test_paused_monitor_does_not_present_actionable_candidate(self):
         row = self.row()
@@ -52,6 +60,27 @@ class ModelTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("DISPLAY"), "需要桌面显示")
 class DesktopTests(unittest.TestCase):
+    def test_footer_and_error_details_remain_visible_in_small_window(self):
+        import tkinter as tk
+        with tempfile.TemporaryDirectory() as directory, patch.object(monitor, "DATA", Path(directory)):
+            root = tk.Tk()
+            root.tk.call("tk", "scaling", 2.0)
+            app = Dashboard(root, monitor.configuration(), monitor)
+            try:
+                root.geometry("1080x700")
+                app.model.ingest("error", "主行情请求失败，保留原因")
+                app.model.ingest("done", "监控已停止")
+                app.refresh(); root.update()
+                self.assertTrue(app.status_bar.winfo_ismapped())
+                self.assertLessEqual(app.status_bar.winfo_y()+app.status_bar.winfo_height(), root.winfo_height())
+                self.assertEqual(app.status.get(), "主行情请求失败，保留原因")
+                self.assertEqual(str(app.state_label.cget("foreground")), "#ff767d")
+                with patch("tkinter.messagebox.showinfo") as show:
+                    app.connection_details()
+                self.assertIn("主行情请求失败", show.call_args.args[1])
+            finally:
+                app.close()
+
     def test_demo_updates_table_chart_alerts_and_clears_on_restart(self):
         import tkinter as tk
         with tempfile.TemporaryDirectory() as directory, patch.object(monitor, "DATA", Path(directory)):

@@ -57,6 +57,33 @@ class ContextTests(unittest.TestCase):
         client.get.side_effect = monitor.ApiError("限流", retry=True, code=4001)
         with self.assertRaises(monitor.ApiError):
             self.context.step(client, self.now, 0)
+        self.assertFalse(self.context.due(60))
+
+    def test_optional_timeout_is_local_and_has_short_request_deadline(self):
+        client = Mock()
+        client.get.side_effect = monitor.ApiError("网络连接失败或超时", retry=True)
+        result = self.context.step(client, self.now, 0)
+        self.assertIn("error", result)
+        self.assertEqual(client.get.call_args.kwargs["request_timeout"], 3)
+        self.assertGreaterEqual(self.context.next["calendar"], self.context.c["context_interval_seconds"])
+        self.assertLess(self.context.next["calendar"], float("inf"))
+
+    def test_optional_timeout_does_not_pause_primary_monitor(self):
+        client = Mock()
+        client.universe.return_value = {"600000.SH": dict(name="测试股票")}
+        def get(path, **kwargs):
+            if path != "/api/a-share/prices/snapshot":
+                raise monitor.ApiError("网络超时", retry=True)
+            return dict(timestamp=int(time.time()*1000), item=[dict(thscode="600000.SH", last_price=10.5, volume=1000, turnover=10500, prev_price=10, open_price=10.2)]), 0.1
+        client.get.side_effect = get
+        events = []
+        with patch.object(monitor, "DATA", Path(self.tmp.name)), patch.object(monitor, "Client", return_value=client), patch.object(monitor, "session_phase", return_value="market"):
+            runner = monitor.Monitor(monitor.configuration(), lambda k,v: events.append((k,v)), threading.Event(), key="test-placeholder", max_cycles=2)
+            runner.run()
+        self.assertEqual(sum(k == "quotes" for k,v in events), 2)
+        self.assertNotIn(("lifecycle", "retrying"), events)
+        self.assertIn("网络超时", (Path(self.tmp.name)/"connection.jsonl").read_text())
+        self.assertNotIn("test-placeholder", (Path(self.tmp.name)/"connection.jsonl").read_text())
 
     def test_optional_switch_and_cache(self):
         self.context.c["context_enabled"] = False
